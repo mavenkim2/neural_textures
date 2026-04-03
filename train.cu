@@ -4,6 +4,7 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
+#include "util/float2.h"
 #include "util/float3.h"
 
 #if defined(__CUDACC__)
@@ -170,10 +171,11 @@ struct BC6Parameters
 
 struct KernelParams
 {
-    BC6Parameters *t0;
-    BC6Parameters *t1;
-    BC6Parameters *t2;
-    BC6Parameters *t3;
+    // params[mip][v * numU + u]
+    BC6Parameters **t0;
+    BC6Parameters **t1;
+    BC6Parameters **t2;
+    BC6Parameters **t3;
 
     int imageWidth;
     int imageHeight;
@@ -193,10 +195,10 @@ NT_DEVICE inline int WrapTexelCoord(int coord, int size)
     return wrapped < 0 ? wrapped + size : wrapped;
 }
 
-NT_DEVICE inline float BilinearWeight(int cornerX, int cornerY, float du, float dv)
+NT_DEVICE inline float BilinearWeight(const int2 &corner, const float2 &texelFrac)
 {
-    float wu = cornerX ? du : (1.f - du);
-    float wv = cornerY ? dv : (1.f - dv);
+    float wu = corner.x ? texelFrac.x : (1.f - texelFrac.x);
+    float wv = corner.y ? texelFrac.y : (1.f - texelFrac.y);
     return wu * wv;
 }
 
@@ -232,9 +234,6 @@ NT_DEVICE inline float3 SampleBC6FeatureTexel(const BC6Parameters *texture,
                                               int texelX,
                                               int texelY)
 {
-    texelX = WrapTexelCoord(texelX, imageWidth);
-    texelY = WrapTexelCoord(texelY, imageHeight);
-
     int paramIndex = (texelY >> 2) * numBlocksU + (texelX >> 2);
     int pixelIndex = ((texelY & 0x3) << 2) + (texelX & 0x3);
 
@@ -252,43 +251,57 @@ NT_DEVICE inline float3 SampleBC6FeatureTexel(const BC6Parameters *texture,
 }
 
 NT_DEVICE inline void
-SampleFourFeaturesBilinear(const KernelParams &params, float u, float v, float3 *outFeatures)
+SampleFourFeaturesTrilinear(const KernelParams &params, float3 uvs, float3 *outFeatures)
 {
-    const BC6Parameters *textures[gNumFeatures] = {
+    const BC6Parameters *const *textures[gNumFeatures] = {
         params.t0,
         params.t1,
         params.t2,
         params.t3,
     };
 
-    float texelU = Clamp(u * float(params.imageWidth) - 0.5f, 0.f, float(params.imageWidth - 1));
-    float texelV = Clamp(v * float(params.imageHeight) - 0.5f, 0.f, float(params.imageHeight - 1));
-    int texelBaseU = int(floorf(texelU));
-    int texelBaseV = int(floorf(texelV));
-    float du = texelU - float(texelBaseU);
-    float dv = texelV - float(texelBaseV);
+    int mipBase = (int)floorf(uvs.z);
+    float mipFrac = uvs.z - floorf(uvs.z);
 
     for (int featureIndex = 0; featureIndex < gNumFeatures; ++featureIndex)
     {
         outFeatures[featureIndex] = make_float3(0.f, 0.f, 0.f);
     }
 
-    for (int corner = 0; corner < 4; corner++)
+    // TODO: consider reordering loads/global memory accesses
+    for (int mipIndex = 0; mipIndex <= 1; mipIndex++)
     {
-        int cornerX = corner & 1;
-        int cornerY = corner >> 1;
-        int texelX = texelBaseU + cornerX;
-        int texelY = texelBaseV + cornerY;
-        float weight = BilinearWeight(cornerX, cornerY, du, dv);
+        int mip = mipBase + mipIndex;
+        int width = params.imageWidth >> mip;
+        int height = params.imageHeight >> mip;
+        int numBlocksU = width >> 2u;
 
-        for (int featureIndex = 0; featureIndex < gNumFeatures; ++featureIndex)
+        float2 imageSize = make_float2(float(width), float(height));
+        float2 texelUV = make_float2(uvs.x, uvs.y) * imageSize - 0.5f;
+        float2 texelBaseUV = Floor(texelUV);
+        int2 texelBase = make_int2(int(texelBaseUV.x), int(texelBaseUV.y));
+        float2 texelFrac = texelUV - texelBaseUV;
+
+        // TODO: unroll?
+        for (int corner = 0; corner < 4; corner++)
         {
-            outFeatures[featureIndex] += weight * SampleBC6FeatureTexel(textures[featureIndex],
-                                                                        params.numBlocksU,
-                                                                        params.imageWidth,
-                                                                        params.imageHeight,
-                                                                        texelX,
-                                                                        texelY);
+            int cornerX = corner & 1;
+            int cornerY = corner >> 1;
+
+            int texelX = texelBase.x + cornerX;
+            int texelY = texelBase.y + cornerY;
+            texelX = WrapTexelCoord(texelX, width);
+            texelY = WrapTexelCoord(texelY, height);
+            float weight = (mipIndex ? mipFrac : 1.f - mipFrac) *
+                           BilinearWeight(make_int2(cornerX, cornerY), texelFrac);
+
+            for (int featureIndex = 0; featureIndex < gNumFeatures; ++featureIndex)
+            {
+                const BC6Parameters *texture = textures[featureIndex][mip];
+                outFeatures[featureIndex] +=
+                    weight *
+                    SampleBC6FeatureTexel(texture, numBlocksU, width, height, texelX, texelY);
+            }
         }
     }
 }
@@ -304,7 +317,7 @@ NT_DEVICE void TrainLoop(const KernelParams params)
         (void)s;
 
         float3 sampledFeatures[gNumFeatures];
-        SampleFourFeaturesBilinear(params, u, v, sampledFeatures);
+        SampleFourFeaturesTrilinear(params, make_float3(u, v, s), sampledFeatures);
 
         // TODO: feed the four sampled feature vectors into the MLP, compare against the
         // filtered reference material sample, and backpropagate into network + BC6 params.
