@@ -7,11 +7,13 @@
 #include "util/float2.h"
 #include "util/float3.h"
 
+#include <tiny-cuda-nn/mma.h>
+
 #if defined(__CUDACC__)
 #define NT_DEVICE __device__
 #endif
 
-static const int gWarpSize = 32;
+#define WARP_SIZE 32
 static const int gNumFeatures = 4;
 static const int gNumBC6PixelsPerBlock = 16;
 static const int gNumIters = 5000;
@@ -47,53 +49,43 @@ struct RNG
     }
 };
 
-template <typename T, int sizeA, int sizeB>
-NT_DEVICE void
-OuterProduct(T *__restrict__ result, const T *__restrict__ a, const T *__restrict__ b)
-{
-    static_assert(sizeA <= gWarpSize);
-    static_assert(sizeB <= gWarpSize);
+// template <typename T, int sizeA, int sizeB>
+// NT_DEVICE void
+// OuterProduct(T *__restrict__ result, const T *__restrict__ a, const T *__restrict__ b)
+// {
+//     static_assert(sizeA <= gWarpSize);
+//     static_assert(sizeB <= gWarpSize);
+//
+//     uint32_t threadID = threadIdx.x;
+//     T val = threadID < sizeB ? b[threadID] : T(0);
+//
+//     for (int i = 0; i < sizeA; i++)
+//     {
+//         T aVal = a[i];
+//         if (threadID < sizeB)
+//         {
+//             result[sizeB * i + threadID] = aVal * val;
+//         }
+//     }
+// }
 
-    uint32_t threadID = threadIdx.x;
-    T val = threadID < sizeB ? b[threadID] : T(0);
-
-    for (int i = 0; i < sizeA; i++)
-    {
-        T aVal = a[i];
-        if (threadID < sizeB)
-        {
-            result[sizeB * i + threadID] = aVal * val;
-        }
-    }
-}
-
-// 1. Sample latents (which also somehow involves BC6 decompress) and reference
-//      a. Train for 5k iterations with "unconstrained parameters" which just means
-//      normal float3s.
-//      b. Then block commpress with BC6.
-// 2. Propagate batch forward through MLP
-// 3. Compute loss and loss gradients
-// 4. Backpropagate
-// 5. Adam/update weights
-// 6. Update latents (since BC6 is differentiable)
-
-template <typename T, int m, int n>
-NT_DEVICE void MatrixMultiply(T *__restrict__ result, T *__restrict__ a, T *__restrict__ b)
-{
-    static_assert(m <= gWarpSize);
-    static_assert(n <= gWarpSize);
-}
-
-template <typename T, int inputSize, int outputSize>
-NT_DEVICE void Backward(const T *__restrict__ outGrad,
-                        const T *__restrict__ inputs,
-                        const T *__restrict__ weights,
-                        T *__restrict__ weightGradient,
-                        T *__restrict__ inputGradient)
-{
-    MatrixMultiply<T, inputSize, outputSize>(inputGradient, weights, outGrad);
-    OuterProduct<T, inputSize, outputSize>(weightGradient, inputs, outGrad);
-}
+// template <typename T, int m, int n>
+// NT_DEVICE void MatrixMultiply(T *result, T *a, T *b)
+// {
+//     static_assert(m <= gWarpSize);
+//     static_assert(n <= gWarpSize);
+// }
+//
+// template <typename T, int inputSize, int outputSize>
+// NT_DEVICE void Backward(const T *__restrict__ outGrad,
+//                         const T *__restrict__ inputs,
+//                         const T *__restrict__ weights,
+//                         T *__restrict__ weightGradient,
+//                         T *__restrict__ inputGradient)
+// {
+//     MatrixMultiply<T, inputSize, outputSize>(inputGradient, weights, outGrad);
+//     OuterProduct<T, inputSize, outputSize>(weightGradient, inputs, outGrad);
+// }
 
 // NT_DEVICE void BackpropagateBC6(float dloss)
 // {
@@ -169,6 +161,11 @@ struct BC6Parameters
     int mode;
 };
 
+static const int gNumNetworkLayers = 2;
+
+#define NT_INPUT_SIZE 12
+#define NT_HIDDEN_LAYER_SIZE 16
+
 struct KernelParams
 {
     // params[mip][v * numU + u]
@@ -176,6 +173,8 @@ struct KernelParams
     BC6Parameters **t1;
     BC6Parameters **t2;
     BC6Parameters **t3;
+
+    half *networkWeights[gNumNetworkLayers];
 
     int imageWidth;
     int imageHeight;
@@ -251,7 +250,7 @@ NT_DEVICE inline float3 SampleBC6FeatureTexel(const BC6Parameters *texture,
 }
 
 NT_DEVICE inline void
-SampleFourFeaturesTrilinear(const KernelParams &params, float3 uvs, float3 *outFeatures)
+SampleFourFeaturesTrilinear(const KernelParams &params, float3 uvs, half *outFeatures)
 {
     const BC6Parameters *const *textures[gNumFeatures] = {
         params.t0,
@@ -263,18 +262,18 @@ SampleFourFeaturesTrilinear(const KernelParams &params, float3 uvs, float3 *outF
     int mipBase = (int)floorf(uvs.z);
     float mipFrac = uvs.z - floorf(uvs.z);
 
-    for (int featureIndex = 0; featureIndex < gNumFeatures; ++featureIndex)
+    for (int featureIndex = 0; featureIndex < gNumFeatures * 3; ++featureIndex)
     {
-        outFeatures[featureIndex] = make_float3(0.f, 0.f, 0.f);
+        outFeatures[featureIndex] = 0;
     }
 
     // TODO: consider reordering loads/global memory accesses
     for (int mipIndex = 0; mipIndex <= 1; mipIndex++)
     {
         int mip = mipBase + mipIndex;
-        int width = params.imageWidth >> mip;
-        int height = params.imageHeight >> mip;
-        int numBlocksU = width >> 2u;
+        int width = max(params.imageWidth >> mip, 1);
+        int height = max(params.imageHeight >> mip, 1);
+        int numBlocksU = max(1, width >> 2);
 
         float2 imageSize = make_float2(float(width), float(height));
         float2 texelUV = make_float2(uvs.x, uvs.y) * imageSize - 0.5f;
@@ -298,17 +297,32 @@ SampleFourFeaturesTrilinear(const KernelParams &params, float3 uvs, float3 *outF
             for (int featureIndex = 0; featureIndex < gNumFeatures; ++featureIndex)
             {
                 const BC6Parameters *texture = textures[featureIndex][mip];
-                outFeatures[featureIndex] +=
-                    weight *
-                    SampleBC6FeatureTexel(texture, numBlocksU, width, height, texelX, texelY);
+                float3 feature = weight * SampleBC6FeatureTexel(
+                                              texture, numBlocksU, width, height, texelX, texelY);
+
+                outFeatures[3 * featureIndex] += feature.x;
+                outFeatures[3 * featureIndex + 1] += feature.y;
+                outFeatures[3 * featureIndex + 2] += feature.z;
             }
         }
     }
 }
 
+// 1. Sample latents (which also somehow involves BC6 decompress) and reference
+//      a. Train for 5k iterations with "unconstrained parameters" which just means
+//      normal float3s.
+//      b. Then block commpress with BC6.
+// 2. Propagate batch forward through MLP
+// 3. Compute loss and loss gradients
+// 4. Backpropagate
+// 5. Adam/update weights
+// 6. Update latents (since BC6 is differentiable)
 NT_DEVICE void TrainLoop(const KernelParams params)
 {
+    const uint32_t threadID = threadIdx.y * blockDim.x + threadIdx.x;
+    const uint32_t lane = threadID & (WARP_SIZE - 1u);
     RNG rng;
+
     for (int iter = 0; iter < gNumIters; iter++)
     {
         float u = rng.UniformFloat();
@@ -316,12 +330,32 @@ NT_DEVICE void TrainLoop(const KernelParams params)
         float s = rng.UniformFloat();
         (void)s;
 
-        float3 sampledFeatures[gNumFeatures];
+        half sampledFeatures[gNumFeatures * 3];
         SampleFourFeaturesTrilinear(params, make_float3(u, v, s), sampledFeatures);
 
         // TODO: feed the four sampled feature vectors into the MLP, compare against the
         // filtered reference material sample, and backpropagate into network + BC6 params.
-        (void)sampledFeatures;
+
+        // TODO: sample the reference textures
+
+        // Forward pass
+        // Hidden layer
+        tcnn::hvec<NT_INPUT_SIZE> inputsVector0(sampledFeatures);
+        tcnn::mma_mat<WARP_SIZE, 16, tcnn::RM> inputsMatrix0(inputsVector0);
+
+        tcnn::mma_mat<16, 16, tcnn::CM> weightsHiddenLayer0 =
+            tcnn::mma_mat<16, 16, tcnn::CM>::from_linear_memory(params.networkWeights[0]);
+
+        auto outputHiddenLayer0 = inputsMatrix0 * weightsHiddenLayer0;
+        tcnn::hvec<NT_HIDDEN_LAYER_SIZE> y0 = outputHiddenLayer0.vec<NT_HIDDEN_LAYER_SIZE>();
+        outputHiddenLayer0.activate<tcnn::Activation::ReLU>();
+
+        // Output layer
+        tcnn::mma_mat<16, 16, tcnn::CM> weightsHiddenLayer1 =
+            tcnn::mma_mat<16, 16, tcnn::CM>::from_linear_memory(params.networkWeights[1]);
+
+        auto finalOutput = outputHiddenLayer0 * weightsHiddenLayer0;
+        finalOutput.activate<tcnn::Activation::ReLU>();
     }
 }
 

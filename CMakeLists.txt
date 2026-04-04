@@ -14,6 +14,17 @@ set(NEURAL_TEXTURES_SOURCES
     main.cpp
 )
 
+set(NT_COMPILE_DEFINITIONS)
+if (WIN32)
+    set(NT_COMPILE_DEFINITIONS NOMINMAX)
+endif()
+set(NT_INCLUDE_DIRECTORIES
+    third_party/tiny-cuda-nn/include
+    third_party/tiny-cuda-nn/dependencies
+    third_party/tiny-cuda-nn/dependencies/cutlass/include
+    third_party/tiny-cuda-nn/dependencies/cutlass/tools/util/include
+)
+
 if(CMAKE_CUDA_COMPILER)
     enable_language(CUDA)
     set(CMAKE_CUDA_STANDARD 17)
@@ -30,4 +41,10 @@ if(CMAKE_CUDA_COMPILER)
     set_target_properties(neural_textures PROPERTIES
         CUDA_SEPARABLE_COMPILATION ON
     )
+    target_compile_definitions(neural_textures PRIVATE ${NT_COMPILE_DEFINITIONS})
+    target_compile_definitions(neural_textures PRIVATE
+        TCNN_MIN_GPU_ARCH=75
+        TCNN_HALF_PRECISION=1
+    )
+    target_include_directories(neural_textures PRIVATE ${NT_INCLUDE_DIRECTORIES})
 endif()
