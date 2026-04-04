@@ -4,21 +4,14 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
+#include "forward_pass.h"
+
 #include "util/float2.h"
 #include "util/float3.h"
 
-#include <tiny-cuda-nn/mma.h>
-
-#if defined(__CUDACC__)
-#define NT_DEVICE __device__
-#endif
-
-#define WARP_SIZE 32
 static const int gNumFeatures = 4;
 static const int gNumBC6PixelsPerBlock = 16;
 static const int gNumIters = 5000;
-
-#define half __half
 
 namespace neural_textures
 {
@@ -162,9 +155,6 @@ struct BC6Parameters
 };
 
 static const int gNumNetworkLayers = 2;
-
-#define NT_INPUT_SIZE 12
-#define NT_HIDDEN_LAYER_SIZE 16
 
 struct KernelParams
 {
@@ -320,7 +310,7 @@ SampleFourFeaturesTrilinear(const KernelParams &params, float3 uvs, half *outFea
 NT_DEVICE void TrainLoop(const KernelParams params)
 {
     const uint32_t threadID = threadIdx.y * blockDim.x + threadIdx.x;
-    const uint32_t lane = threadID & (WARP_SIZE - 1u);
+    (void)threadID;
     RNG rng;
 
     for (int iter = 0; iter < gNumIters; iter++)
@@ -328,7 +318,6 @@ NT_DEVICE void TrainLoop(const KernelParams params)
         float u = rng.UniformFloat();
         float v = rng.UniformFloat();
         float s = rng.UniformFloat();
-        (void)s;
 
         half sampledFeatures[gNumFeatures * 3];
         SampleFourFeaturesTrilinear(params, make_float3(u, v, s), sampledFeatures);
@@ -337,32 +326,20 @@ NT_DEVICE void TrainLoop(const KernelParams params)
         // filtered reference material sample, and backpropagate into network + BC6 params.
 
         // TODO: sample the reference textures
+        float expected[NT_OUTPUT_SIZE] = {};
 
-        // Forward pass
-        // Hidden layer
-        tcnn::hvec<NT_INPUT_SIZE> inputsVector0(sampledFeatures);
-        tcnn::mma_mat<WARP_SIZE, 16, tcnn::RM> inputsMatrix0(inputsVector0);
+        tcnn::hvec<NT_OUTPUT_SIZE> outputVec =
+            ForwardPass(sampledFeatures, params.networkWeights[0], params.networkWeights[1]);
 
-        tcnn::mma_mat<16, 16, tcnn::CM> weightsHiddenLayer0 =
-            tcnn::mma_mat<16, 16, tcnn::CM>::from_linear_memory(params.networkWeights[0]);
-
-        auto outputHiddenLayer0 = inputsMatrix0 * weightsHiddenLayer0;
-        tcnn::hvec<NT_HIDDEN_LAYER_SIZE> y0 = outputHiddenLayer0.vec<NT_HIDDEN_LAYER_SIZE>();
-        outputHiddenLayer0.activate<tcnn::Activation::ReLU>();
-
-        // Output layer
-        tcnn::mma_mat<16, 16, tcnn::CM> weightsHiddenLayer1 =
-            tcnn::mma_mat<16, 16, tcnn::CM>::from_linear_memory(params.networkWeights[1]);
-
-        auto finalOutput = outputHiddenLayer0 * weightsHiddenLayer0;
-        finalOutput.activate<tcnn::Activation::ReLU>();
+        // Calculate MSE loss
+        float mse = 0.f;
+        for (int i = 0; i < NT_OUTPUT_SIZE; i++)
+        {
+            float outputValue = __half2float(outputVec[i]);
+            float error = outputValue - expected[i];
+            mse += error * error;
+        }
     }
 }
-
-struct Layer
-{
-    // 32-byte aligned
-    half *weights;
-};
 
 } // namespace neural_textures

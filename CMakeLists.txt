@@ -29,7 +29,10 @@ if(CMAKE_CUDA_COMPILER)
     enable_language(CUDA)
     set(CMAKE_CUDA_STANDARD 17)
     set(CMAKE_CUDA_STANDARD_REQUIRED ON)
-    list(APPEND NEURAL_TEXTURES_SOURCES train.cu)
+    list(APPEND NEURAL_TEXTURES_SOURCES
+        tests/forward_pass_test.cu
+        train.cu
+    )
     message(STATUS "CUDA compiler found: ${CMAKE_CUDA_COMPILER}")
 else()
     message(STATUS "CUDA compiler not found; building without train.cu")

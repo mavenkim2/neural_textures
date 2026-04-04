@@ -1,6 +1,9 @@
 #include <algorithm>
+#include <cstdio>
 #include <cstdlib>
 #include <cstdint>
+
+#include "tests/forward_pass_test.h"
 
 static inline float ReLU(float v)
 {
@@ -55,7 +58,17 @@ void Layer::Backpropagate() const
 
 int main(int argc, int argv[])
 {
+    (void)argc;
+    (void)argv;
+
+    if (!neural_textures::RunForwardPassTest())
+    {
+        std::printf("ForwardPassTest failed\n");
+        return 1;
+    }
+
     float *image = 0;
+    (void)image;
 
     // Train
     const int hiddenLayerSize = 16;
