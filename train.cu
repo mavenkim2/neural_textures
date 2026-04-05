@@ -4,7 +4,7 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
-#include "forward_pass.h"
+#include "mlp.h"
 
 #include "util/float2.h"
 #include "util/float3.h"
@@ -62,13 +62,6 @@ struct RNG
 //     }
 // }
 
-// template <typename T, int m, int n>
-// NT_DEVICE void MatrixMultiply(T *result, T *a, T *b)
-// {
-//     static_assert(m <= gWarpSize);
-//     static_assert(n <= gWarpSize);
-// }
-//
 // template <typename T, int inputSize, int outputSize>
 // NT_DEVICE void Backward(const T *__restrict__ outGrad,
 //                         const T *__restrict__ inputs,
@@ -171,6 +164,8 @@ struct KernelParams
     int numMips;
     int numBlocksU;
     int numBlocksV;
+
+    int numSamples;
 };
 
 NT_DEVICE inline float Clamp(float x, float low, float high)
@@ -313,7 +308,7 @@ NT_DEVICE void TrainLoop(const KernelParams params)
     (void)threadID;
     RNG rng;
 
-    for (int iter = 0; iter < gNumIters; iter++)
+    // for (int iter = 0; iter < gNumIters; iter++)
     {
         float u = rng.UniformFloat();
         float v = rng.UniformFloat();
@@ -333,12 +328,18 @@ NT_DEVICE void TrainLoop(const KernelParams params)
 
         // Calculate MSE loss
         float mse = 0.f;
+        tcnn::hvec<NT_OUTPUT_SIZE> lossGradient;
         for (int i = 0; i < NT_OUTPUT_SIZE; i++)
         {
             float outputValue = __half2float(outputVec[i]);
             float error = outputValue - expected[i];
             mse += error * error;
+
+            float loss = 2 * error / float(params.numSamples);
+            lossGradient[i] = __float2half(loss);
         }
+
+        // BackwardPass(lossGradient, params.networkWeights[0], params.networkWeights[1]);
     }
 }
 

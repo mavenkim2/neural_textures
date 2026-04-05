@@ -1,6 +1,6 @@
 #include "forward_pass_test.h"
 
-#include "../forward_pass.h"
+#include "../mlp.h"
 
 #include <cmath>
 #include <cstdio>
