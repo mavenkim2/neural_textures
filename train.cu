@@ -42,37 +42,6 @@ struct RNG
     }
 };
 
-// template <typename T, int sizeA, int sizeB>
-// NT_DEVICE void
-// OuterProduct(T *__restrict__ result, const T *__restrict__ a, const T *__restrict__ b)
-// {
-//     static_assert(sizeA <= gWarpSize);
-//     static_assert(sizeB <= gWarpSize);
-//
-//     uint32_t threadID = threadIdx.x;
-//     T val = threadID < sizeB ? b[threadID] : T(0);
-//
-//     for (int i = 0; i < sizeA; i++)
-//     {
-//         T aVal = a[i];
-//         if (threadID < sizeB)
-//         {
-//             result[sizeB * i + threadID] = aVal * val;
-//         }
-//     }
-// }
-
-// template <typename T, int inputSize, int outputSize>
-// NT_DEVICE void Backward(const T *__restrict__ outGrad,
-//                         const T *__restrict__ inputs,
-//                         const T *__restrict__ weights,
-//                         T *__restrict__ weightGradient,
-//                         T *__restrict__ inputGradient)
-// {
-//     MatrixMultiply<T, inputSize, outputSize>(inputGradient, weights, outGrad);
-//     OuterProduct<T, inputSize, outputSize>(weightGradient, inputs, outGrad);
-// }
-
 // NT_DEVICE void BackpropagateBC6(float dloss)
 // {
 //     float y;
@@ -105,40 +74,6 @@ struct RNG
 //     float dy_de1 = dy_debar1 * deibar_dei;
 // }
 
-// NT_DEVICE void BackpropagateTrilinear()
-// {
-//     // 31/64 unsigned, 31/32 signed
-//     int b = 1;
-//
-//     // Backpropagate through trilinear filtering
-//     float s = 0.f;     // ?
-//     float dloss = 0.f; // ?
-//     float2 uv = ? ;
-//
-//     float du0;
-//     float dv0;
-//
-//     float du1;
-//     float dv1;
-//
-//     float sFrac = s - floorf(s);
-//
-//     // ts0 means closest lower mip. ts1 means closest higher mip
-//     float dloss_ts0_00 = (1.f - sFrac) * (1 - du0) * (1 - dv0) * dloss;
-//     float dloss_ts0_10 = (1.f - sFrac) * du0 * (1 - dv0) * dloss;
-//     float dloss_ts0_01 = (1.f - sFrac) * (1 - du0) * dv0 * dloss;
-//     float dloss_ts0_11 = (1.f - sFrac) * du0 * dv0 * dloss;
-//
-//     float dloss_ts1_00 = sFrac * (1 - du1) * (1 - dv1) * dloss;
-//     float dloss_ts1_10 = sFrac * du1 * (1 - dv1) * dloss;
-//     float dloss_ts1_01 = sFrac * (1 - du1) * dv1 * dloss;
-//     float dloss_ts1_11 = sFrac * du1 * dv1 * dloss;
-//
-//     // Backpropagate to BC6 format
-//
-//     float dloss_over_dei = dloss_over_dei_bar * dei_bar_over_dei;
-// }
-
 struct BC6Parameters
 {
     float3 endpoints[4];
@@ -147,17 +82,23 @@ struct BC6Parameters
     int mode;
 };
 
+struct Feature
+{
+    BC6Parameters **grid;
+    int width; // in texels
+    int height;
+};
+
 static const int gNumNetworkLayers = 2;
 
 struct KernelParams
 {
     // params[mip][v * numU + u]
-    BC6Parameters **t0;
-    BC6Parameters **t1;
-    BC6Parameters **t2;
-    BC6Parameters **t3;
+    Feature features[gNumFeatures];
 
     half *networkWeights[gNumNetworkLayers];
+
+    __half2 *networkMovingAverages[gNumNetworkLayers];
 
     int imageWidth;
     int imageHeight;
@@ -211,6 +152,36 @@ DecompressBC6(const float3 &endpoint0, const float3 &endpoint1, int b, float x)
     return w;
 }
 
+NT_DEVICE inline float3 DecompressBC6IntermediateValues(const float3 &endpoint0,
+                                                        const float3 &endpoint1,
+                                                        int b,
+                                                        float x,
+                                                        float3 &unquantizedEndpoint0,
+                                                        float3 &unquantizedEndpoint1,
+                                                        float3 &y)
+{
+    const int q = 3;
+    unquantizedEndpoint0 = UnquantizeEndpoints(endpoint0, b);
+    unquantizedEndpoint1 = UnquantizeEndpoints(endpoint1, b);
+
+    y = unquantizedEndpoint0 + Ldexp(unquantizedEndpoint1 - unquantizedEndpoint0, q) * x;
+    float3 hyFloat = Max(Floor((y - 1.f) / 1024.f) - 1.f, 0.f);
+    int3 hy = make_int3(hyFloat);
+
+    float3 w = Ldexp(y / 1024.f - make_float3(hy), hy - 14);
+    return w;
+}
+
+NT_DEVICE inline int GetBlockParamIndex(int texelX, int texelY, int numBlocksU)
+{
+    return (texelY >> 2) * numBlocksU + (texelX >> 2);
+}
+
+NT_DEVICE inline int GetBlockPixelIndex(int texelX, int texelY)
+{
+    return ((texelY & 0x3) << 2) + (texelX & 0x3);
+}
+
 NT_DEVICE inline float3 SampleBC6FeatureTexel(const BC6Parameters *texture,
                                               int numBlocksU,
                                               int imageWidth,
@@ -218,8 +189,8 @@ NT_DEVICE inline float3 SampleBC6FeatureTexel(const BC6Parameters *texture,
                                               int texelX,
                                               int texelY)
 {
-    int paramIndex = (texelY >> 2) * numBlocksU + (texelX >> 2);
-    int pixelIndex = ((texelY & 0x3) << 2) + (texelX & 0x3);
+    int paramIndex = GetBlockParamIndex(texelX, texelY, numBlocksU);
+    int pixelIndex = GetBlockPixelIndex(texelX, texelY);
 
     const BC6Parameters &bc6Params = texture[paramIndex];
     int mask = gBC6HPartitionSets[bc6Params.partition];
@@ -237,13 +208,6 @@ NT_DEVICE inline float3 SampleBC6FeatureTexel(const BC6Parameters *texture,
 NT_DEVICE inline void
 SampleFourFeaturesTrilinear(const KernelParams &params, float3 uvs, half *outFeatures)
 {
-    const BC6Parameters *const *textures[gNumFeatures] = {
-        params.t0,
-        params.t1,
-        params.t2,
-        params.t3,
-    };
-
     int mipBase = (int)floorf(uvs.z);
     float mipFrac = uvs.z - floorf(uvs.z);
 
@@ -253,35 +217,38 @@ SampleFourFeaturesTrilinear(const KernelParams &params, float3 uvs, half *outFea
     }
 
     // TODO: consider reordering loads/global memory accesses
-    for (int mipIndex = 0; mipIndex <= 1; mipIndex++)
+
+    for (int featureIndex = 0; featureIndex < gNumFeatures; ++featureIndex)
     {
-        int mip = mipBase + mipIndex;
-        int width = max(params.imageWidth >> mip, 1);
-        int height = max(params.imageHeight >> mip, 1);
-        int numBlocksU = max(1, width >> 2);
-
-        float2 imageSize = make_float2(float(width), float(height));
-        float2 texelUV = make_float2(uvs.x, uvs.y) * imageSize - 0.5f;
-        float2 texelBaseUV = Floor(texelUV);
-        int2 texelBase = make_int2(int(texelBaseUV.x), int(texelBaseUV.y));
-        float2 texelFrac = texelUV - texelBaseUV;
-
-        // TODO: unroll?
-        for (int corner = 0; corner < 4; corner++)
+        const Feature &feature = params.features[featureIndex];
+        for (int mipIndex = 0; mipIndex <= 1; mipIndex++)
         {
-            int cornerX = corner & 1;
-            int cornerY = corner >> 1;
+            int mip = mipBase + mipIndex;
+            const BC6Parameters *texture = feature.grid[mip];
 
-            int texelX = texelBase.x + cornerX;
-            int texelY = texelBase.y + cornerY;
-            texelX = WrapTexelCoord(texelX, width);
-            texelY = WrapTexelCoord(texelY, height);
-            float weight = (mipIndex ? mipFrac : 1.f - mipFrac) *
-                           BilinearWeight(make_int2(cornerX, cornerY), texelFrac);
+            int width = max(feature.width >> mip, 1);
+            int height = max(feature.height >> mip, 1);
+            int numBlocksU = max(1, width >> 2);
 
-            for (int featureIndex = 0; featureIndex < gNumFeatures; ++featureIndex)
+            float2 imageSize = make_float2(float(width), float(height));
+            float2 texelUV = make_float2(uvs.x, uvs.y) * imageSize - 0.5f;
+            float2 texelBaseUV = Floor(texelUV);
+            int2 texelBase = make_int2(int(texelBaseUV.x), int(texelBaseUV.y));
+            float2 texelFrac = texelUV - texelBaseUV;
+
+            // TODO: unroll?
+            for (int corner = 0; corner < 4; corner++)
             {
-                const BC6Parameters *texture = textures[featureIndex][mip];
+                int cornerX = corner & 1;
+                int cornerY = corner >> 1;
+
+                int texelX = texelBase.x + cornerX;
+                int texelY = texelBase.y + cornerY;
+                texelX = WrapTexelCoord(texelX, width);
+                texelY = WrapTexelCoord(texelY, height);
+                float weight = (mipIndex ? mipFrac : 1.f - mipFrac) *
+                               BilinearWeight(make_int2(cornerX, cornerY), texelFrac);
+
                 float3 feature = weight * SampleBC6FeatureTexel(
                                               texture, numBlocksU, width, height, texelX, texelY);
 
@@ -292,6 +259,85 @@ SampleFourFeaturesTrilinear(const KernelParams &params, float3 uvs, half *outFea
         }
     }
 }
+
+NT_DEVICE inline void
+BackwardFeaturePass(const KernelParams &params, float3 uvs, half *inputGradient)
+{
+    int mipBase = (int)floorf(uvs.z);
+    float mipFrac = uvs.z - floorf(uvs.z);
+
+    // TODO: consider reordering loads/global memory accesses
+    for (int featureIndex = 0; featureIndex < gNumFeatures; ++featureIndex)
+    {
+        const Feature &feature = params.features[featureIndex];
+        for (int mipIndex = 0; mipIndex <= 1; mipIndex++)
+        {
+            int mip = mipBase + mipIndex;
+            int width = max(params.imageWidth >> mip, 1);
+            int height = max(params.imageHeight >> mip, 1);
+            int numBlocksU = max(1, width >> 2);
+
+            float2 imageSize = make_float2(float(width), float(height));
+            float2 texelUV = make_float2(uvs.x, uvs.y) * imageSize - 0.5f;
+            float2 texelBaseUV = Floor(texelUV);
+            int2 texelBase = make_int2(int(texelBaseUV.x), int(texelBaseUV.y));
+            float2 texelFrac = texelUV - texelBaseUV;
+
+            // TODO: unroll?
+            for (int corner = 0; corner < 4; corner++)
+            {
+                int cornerX = corner & 1;
+                int cornerY = corner >> 1;
+
+                int texelX = texelBase.x + cornerX;
+                int texelY = texelBase.y + cornerY;
+                texelX = WrapTexelCoord(texelX, width);
+                texelY = WrapTexelCoord(texelY, height);
+                float weight = (mipIndex ? mipFrac : 1.f - mipFrac) *
+                               BilinearWeight(make_int2(cornerX, cornerY), texelFrac);
+
+                const int pixelIndex = GetBlockPixelIndex(texelX, texelY);
+                const int paramIndex = GetBlockParamIndex(texelX, texelY, numBlocksU);
+
+                const BC6Parameters *texture = feature.grid[mip];
+                const BC6Parameters &blockParameters = texture[paramIndex];
+
+                int mask = gBC6HPartitionSets[blockParameters.partition];
+                int partition = (mask >> pixelIndex) & 0x1;
+                int endpointBase = 2 * partition;
+                float3 endpoint0 = blockParameters.endpoints[endpointBase + 0];
+                float3 endpoint1 = blockParameters.endpoints[endpointBase + 1];
+                const int endpointBits = gBC6HPartitionNumBits[blockParameters.mode];
+                float pixelIndexOnSegment = blockParameters.pixelIndices[pixelIndex];
+
+                float3 ebar0, ebar1, y;
+                DecompressBC6IntermediateValues(
+                    endpoint0, endpoint1, endpointBits, pixelIndexOnSegment, ebar0, ebar1, y);
+
+                float3 featureGrad =
+                    weight * make_float3(float(inputGradient[3 * featureIndex]),
+                                         float(inputGradient[3 * featureIndex + 1]),
+                                         float(inputGradient[3 * featureIndex + 2]));
+
+                // Backpropagate through BC6
+                const int q = 3;
+                int3 hy = make_int3(Max(Floor((y - 1.f) / 1024.f) - 1.f, 0.f);
+                // float3 dw_dy = make_float3(1 << (hy - 24));
+                const float3 dl_dy = Ldexp(featureGrad, hy - 24);
+
+                float alpha = ldexpf(pixelIndexOnSegment, q);
+                float3 dy_dx = Ldexp(ebar1 - ebar0, q);
+
+                const float a = 31.f / 64;
+                float deibar_dei = ldexpf(a, 16 - endpointBits);
+
+                float3 dl_dx = dl_dy * dy_dx;
+                float3 dl_de0 = (1.f - alpha) * deibar_dei * dl_dy;
+                float3 dl_de1 = alpha * deibar_dei * dl_dy;
+            }
+        }
+    }
+} // namespace neural_textures
 
 // 1. Sample latents (which also somehow involves BC6 decompress) and reference
 //      a. Train for 5k iterations with "unconstrained parameters" which just means
@@ -340,7 +386,11 @@ NT_DEVICE void TrainLoop(const KernelParams params)
         }
 
         // BackwardPass(lossGradient, params.networkWeights[0], params.networkWeights[1]);
+
+        // gradient of loss w.r.t 12 inputs
     }
 }
+
+NT_DEVICE void OptimizePass(const KernelParams params) {}
 
 } // namespace neural_textures

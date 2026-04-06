@@ -47,6 +47,11 @@ NT_HOST_DEVICE inline float3 operator*(const float3 &a, float b)
     return make_float3(a.x * b, a.y * b, a.z * b);
 }
 
+NT_HOST_DEVICE inline float3 operator*(const float3 &a, const float3 &b)
+{
+    return make_float3(a.x * b.x, a.y * b.y, a.z * b.z);
+}
+
 NT_HOST_DEVICE inline float3 operator*(float a, const float3 &b)
 {
     return b * a;

@@ -50,7 +50,8 @@ NT_DEVICE inline void BackwardPass(const tcnn::hvec<NT_OUTPUT_SIZE> &lossGradien
                                    const tcnn::hvec<NT_HIDDEN_LAYER_SIZE> &activatedHiddenLayer0,
                                    const tcnn::hvec<NT_INPUT_SIZE> &networkInput,
                                    const half *weightsHidden0,
-                                   const half *weightsHidden1)
+                                   const half *weightsHidden1,
+                                   half *outputLayerBiasGradients)
 {
     tcnn::mma_vec<16> lossGradientMatrix(lossGradientVector); // 32x8
     tcnn::mma_mat<16, 16, tcnn::CM> weightsOutput =
@@ -58,8 +59,12 @@ NT_DEVICE inline void BackwardPass(const tcnn::hvec<NT_OUTPUT_SIZE> &lossGradien
     auto hiddenGradientMatrix = lossGradientMatrix * weightsOutput.transpose(); // 32x16
 
     tcnn::mma_vec<NT_HIDDEN_LAYER_SIZE> outputLayerInput(activatedHiddenLayer0); // 32x16
+    hiddenGradientMatrix.activate_bwd<tcnn::Activation::ReLU>(outputLayerInput);
     auto outputWeightGradientMatrix =
         tcnn::outer_product(outputLayerInput, lossGradientMatrix); // 16x8
+
+    // Write to memory
+    lossGradientVector.to_linear_memory(outputLayerBiasGradients);
 
     tcnn::mma_mat<16, 16, tcnn::CM> weightsHiddenLayer0 =
         tcnn::mma_mat<16, 16, tcnn::CM>::from_linear_memory(weightsHidden0);           // 12x16
@@ -68,6 +73,38 @@ NT_DEVICE inline void BackwardPass(const tcnn::hvec<NT_OUTPUT_SIZE> &lossGradien
     tcnn::mma_vec<16> networkInputMatrix(networkInput); // 32x12
     auto hiddenWeightGradientMatrix =
         tcnn::outer_product(networkInputMatrix, hiddenGradientMatrix); // 12x16
+}
+
+struct AdamConstants
+{
+    float beta1;
+    float beta2;
+    float learningRate;
+    float decay;
+};
+
+template <typename T>
+inline T Lerp(T x, T y, T s)
+{
+    return (T(1) - s) * x + s * y;
+}
+
+NT_DEVICE inline void AdamOptimize(AdamConstants &constants,
+                                   float &moment1,
+                                   float &moment2,
+                                   float learningRate,
+                                   float invBiasCorrection,
+                                   float epsilon,
+                                   float weight)
+{
+    float gradient;
+    float firstMoment = Lerp(gradient, moment1, constants.beta1);
+    float secondMoment = Lerp(gradient * gradient, moment2, constants.beta2);
+
+    // TODO: potential variant is to not correct first moment?
+    float mhat = firstMoment * invBiasCorrection;
+    float vhat = secondMoment * invBiasCorrection;
+    float newWeight = weight - learningRate * mhat / (sqrtf(vhat) + epsilon);
 }
 
 } // namespace neural_textures
