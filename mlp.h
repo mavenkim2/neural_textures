@@ -19,17 +19,21 @@ namespace neural_textures
 
 NT_DEVICE inline tcnn::hvec<NT_OUTPUT_SIZE>
 ForwardPass(const half *sampledFeatures,
-            const half *weightsHidden0,
-            const half *weightsHidden1,
+            const half *weightsLayer0,
+            const half *weightsLayer1,
+            const half *biasesLayer0,
+            const half *biasesLayer1,
             tcnn::hvec<NT_HIDDEN_LAYER_SIZE> *activatedHiddenLayer0 = 0)
 {
     tcnn::hvec<NT_INPUT_SIZE> inputsVector0(sampledFeatures);
     tcnn::mma_mat<WARP_SIZE, 16, tcnn::RM> inputsMatrix0(inputsVector0);
 
     tcnn::mma_mat<16, 16, tcnn::CM> weightsHiddenLayer0 =
-        tcnn::mma_mat<16, 16, tcnn::CM>::from_linear_memory(weightsHidden0);
+        tcnn::mma_mat<16, 16, tcnn::CM>::from_linear_memory(weightsLayer0);
+    tcnn::hvec<NT_HIDDEN_LAYER_SIZE> vecBiasesLayer0(biasesLayer0);
+    tcnn::mma_vec<NT_HIDDEN_LAYER_SIZE> matBiasesLayer0(vecBiasesLayer0);
 
-    auto outputHiddenLayer0 = inputsMatrix0 * weightsHiddenLayer0;
+    auto outputHiddenLayer0 = madd(inputsMatrix0, weightsHiddenLayer0, matBiasesLayer0);
     outputHiddenLayer0.activate<tcnn::Activation::ReLU>();
 
     if (activatedHiddenLayer0)
@@ -38,20 +42,26 @@ ForwardPass(const half *sampledFeatures,
     }
 
     tcnn::mma_mat<16, 16, tcnn::CM> weightsHiddenLayer1 =
-        tcnn::mma_mat<16, 16, tcnn::CM>::from_linear_memory(weightsHidden1);
+        tcnn::mma_mat<16, 16, tcnn::CM>::from_linear_memory(weightsLayer1);
+    tcnn::hvec<NT_HIDDEN_LAYER_SIZE> vecBiasesLayer1(biasesLayer1);
+    tcnn::mma_vec<NT_HIDDEN_LAYER_SIZE> matBiasesLayer1(vecBiasesLayer1);
 
-    auto finalOutput = outputHiddenLayer0 * weightsHiddenLayer1;
+    auto finalOutput = madd(outputHiddenLayer0, weightsHiddenLayer1, matBiasesLayer1);
     // finalOutput.activate<tcnn::Activation::ReLU>();
 
     return finalOutput.vec<NT_OUTPUT_SIZE>();
 }
 
-NT_DEVICE inline void BackwardPass(const tcnn::hvec<NT_OUTPUT_SIZE> &lossGradientVector,
+template <uint32_t numThreads>
+NT_DEVICE inline auto BackwardPass(const tcnn::hvec<NT_OUTPUT_SIZE> &lossGradientVector,
                                    const tcnn::hvec<NT_HIDDEN_LAYER_SIZE> &activatedHiddenLayer0,
                                    const tcnn::hvec<NT_INPUT_SIZE> &networkInput,
                                    const half *weightsHidden0,
                                    const half *weightsHidden1,
-                                   half *outputLayerBiasGradients)
+                                   half *layer0WeightGradients,
+                                   half *layer1WeightGradients,
+                                   half *layer0BiasGradients,
+                                   half *layer1BiasGradients)
 {
     tcnn::mma_vec<16> lossGradientMatrix(lossGradientVector); // 32x8
     tcnn::mma_mat<16, 16, tcnn::CM> weightsOutput =
@@ -64,7 +74,9 @@ NT_DEVICE inline void BackwardPass(const tcnn::hvec<NT_OUTPUT_SIZE> &lossGradien
         tcnn::outer_product(outputLayerInput, lossGradientMatrix); // 16x8
 
     // Write to memory
-    lossGradientVector.to_linear_memory(outputLayerBiasGradients);
+    outputWeightGradientMatrix.sum_into_linear_global_memory_hierarchical<numThreads>(
+        layer1WeightGradients);
+    // lossGradientVector.to_linear_memory(outputLayerBiasGradients);
 
     tcnn::mma_mat<16, 16, tcnn::CM> weightsHiddenLayer0 =
         tcnn::mma_mat<16, 16, tcnn::CM>::from_linear_memory(weightsHidden0);           // 12x16
@@ -73,6 +85,10 @@ NT_DEVICE inline void BackwardPass(const tcnn::hvec<NT_OUTPUT_SIZE> &lossGradien
     tcnn::mma_vec<16> networkInputMatrix(networkInput); // 32x12
     auto hiddenWeightGradientMatrix =
         tcnn::outer_product(networkInputMatrix, hiddenGradientMatrix); // 12x16
+    hiddenWeightGradientMatrix.sum_into_linear_global_memory_hierarchical<numThreads>(
+        layer1WeightGradients);
+    //
+    return inputGradientMatrix;
 }
 
 struct AdamConstants

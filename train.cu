@@ -6,6 +6,7 @@
 
 #include "mlp.h"
 
+#include "util/atomic.h"
 #include "util/float2.h"
 #include "util/float3.h"
 
@@ -42,38 +43,6 @@ struct RNG
     }
 };
 
-// NT_DEVICE void BackpropagateBC6(float dloss)
-// {
-//     float y;
-//     float x;                   // pixel index
-//     int partitionSetIndex = 0; // partition set index, 0..31
-//     int partitionSet = gBC6HPartitionSets[partitionSetIndex];
-//     int pixel;
-//     int partition = (partitionSet >> pixel) & 0x1;
-//     float ebar2, ebar1;
-//     float ebar3, ebar4;
-//
-//     const int q = 3; // TODO: always 3?
-//
-//     float hy = fmaxf(floorf((y - 1.f) / 1024.f), 0.f);
-//     float dwdy = (1u << (hy - 24));
-//
-//     float alpha = (1 << q) * x;
-//     float dy_debar1 = partition * (1.f - alpha); //
-//     float dy_debar2 = partition * alpha;
-//
-//     float dy_debar3 = (1 - partition) * (1.f - alpha); //
-//     float dy_debar4 = (1 - partition) * alpha;
-//
-//     float dy_dx =
-//         partition * (1 << q) * (ebar2 - ebar1) + (1 - partition) * (1 << q) * (ebar4 - ebar3);
-//
-//     const float a = 31.f / 64;
-//     float deibar_dei = a * (1 << (16 - b));
-//
-//     float dy_de1 = dy_debar1 * deibar_dei;
-// }
-
 struct BC6Parameters
 {
     float3 endpoints[4];
@@ -82,9 +51,17 @@ struct BC6Parameters
     int mode;
 };
 
+struct BC6ParameterGradients
+{
+    float3 endpoints[4];
+    float pixelIndices[gNumBC6PixelsPerBlock];
+};
+
 struct Feature
 {
     BC6Parameters **grid;
+    BC6ParameterGradients **gradients;
+
     int width; // in texels
     int height;
 };
@@ -96,9 +73,12 @@ struct KernelParams
     // params[mip][v * numU + u]
     Feature features[gNumFeatures];
 
+    // NOTE: padded to 16x16
     half *networkWeights[gNumNetworkLayers];
+    half *networkWeightGradients[gNumNetworkLayers];
 
-    __half2 *networkMovingAverages[gNumNetworkLayers];
+    half *networkBiases[gNumNetworkLayers];
+    half *networkBiasGradients[gNumNetworkLayers];
 
     int imageWidth;
     int imageHeight;
@@ -260,8 +240,7 @@ SampleFourFeaturesTrilinear(const KernelParams &params, float3 uvs, half *outFea
     }
 }
 
-NT_DEVICE inline void
-BackwardFeaturePass(const KernelParams &params, float3 uvs, half *inputGradient)
+NT_DEVICE inline void BackwardFeaturePass(KernelParams &params, float3 uvs, half *inputGradient)
 {
     int mipBase = (int)floorf(uvs.z);
     float mipFrac = uvs.z - floorf(uvs.z);
@@ -269,12 +248,12 @@ BackwardFeaturePass(const KernelParams &params, float3 uvs, half *inputGradient)
     // TODO: consider reordering loads/global memory accesses
     for (int featureIndex = 0; featureIndex < gNumFeatures; ++featureIndex)
     {
-        const Feature &feature = params.features[featureIndex];
+        Feature &feature = params.features[featureIndex];
         for (int mipIndex = 0; mipIndex <= 1; mipIndex++)
         {
             int mip = mipBase + mipIndex;
-            int width = max(params.imageWidth >> mip, 1);
-            int height = max(params.imageHeight >> mip, 1);
+            int width = max(feature.width >> mip, 1);
+            int height = max(feature.height >> mip, 1);
             int numBlocksU = max(1, width >> 2);
 
             float2 imageSize = make_float2(float(width), float(height));
@@ -300,6 +279,7 @@ BackwardFeaturePass(const KernelParams &params, float3 uvs, half *inputGradient)
                 const int paramIndex = GetBlockParamIndex(texelX, texelY, numBlocksU);
 
                 const BC6Parameters *texture = feature.grid[mip];
+                BC6ParameterGradients &outGradients = feature.gradients[mip][paramIndex];
                 const BC6Parameters &blockParameters = texture[paramIndex];
 
                 int mask = gBC6HPartitionSets[blockParameters.partition];
@@ -321,7 +301,7 @@ BackwardFeaturePass(const KernelParams &params, float3 uvs, half *inputGradient)
 
                 // Backpropagate through BC6
                 const int q = 3;
-                int3 hy = make_int3(Max(Floor((y - 1.f) / 1024.f) - 1.f, 0.f);
+                int3 hy = make_int3(Max(Floor((y - 1.f) / 1024.f) - 1.f, 0.f));
                 // float3 dw_dy = make_float3(1 << (hy - 24));
                 const float3 dl_dy = Ldexp(featureGrad, hy - 24);
 
@@ -331,13 +311,17 @@ BackwardFeaturePass(const KernelParams &params, float3 uvs, half *inputGradient)
                 const float a = 31.f / 64;
                 float deibar_dei = ldexpf(a, 16 - endpointBits);
 
-                float3 dl_dx = dl_dy * dy_dx;
+                float dl_dx = Dot(dl_dy, dy_dx);
                 float3 dl_de0 = (1.f - alpha) * deibar_dei * dl_dy;
                 float3 dl_de1 = alpha * deibar_dei * dl_dy;
+
+                atomicAdd(&outGradients.endpoints[endpointBase + 0], dl_de0);
+                atomicAdd(&outGradients.endpoints[endpointBase + 1], dl_de1);
+                atomicAdd(&outGradients.pixelIndices[pixelIndex], dl_dx);
             }
         }
     }
-} // namespace neural_textures
+}
 
 // 1. Sample latents (which also somehow involves BC6 decompress) and reference
 //      a. Train for 5k iterations with "unconstrained parameters" which just means
@@ -348,6 +332,8 @@ BackwardFeaturePass(const KernelParams &params, float3 uvs, half *inputGradient)
 // 4. Backpropagate
 // 5. Adam/update weights
 // 6. Update latents (since BC6 is differentiable)
+
+template <uint32_t numThreads>
 NT_DEVICE void TrainLoop(const KernelParams params)
 {
     const uint32_t threadID = threadIdx.y * blockDim.x + threadIdx.x;
@@ -369,8 +355,13 @@ NT_DEVICE void TrainLoop(const KernelParams params)
         // TODO: sample the reference textures
         float expected[NT_OUTPUT_SIZE] = {};
 
-        tcnn::hvec<NT_OUTPUT_SIZE> outputVec =
-            ForwardPass(sampledFeatures, params.networkWeights[0], params.networkWeights[1]);
+        tcnn::hvec<NT_HIDDEN_LAYER_SIZE> activatedHiddenLayer0;
+        tcnn::hvec<NT_OUTPUT_SIZE> outputVec = ForwardPass(sampledFeatures,
+                                                           params.networkWeights[0],
+                                                           params.networkWeights[1],
+                                                           params.networkBiases[0],
+                                                           params.networkBiases[1],
+                                                           &activatedHiddenLayer0);
 
         // Calculate MSE loss
         float mse = 0.f;
@@ -385,7 +376,16 @@ NT_DEVICE void TrainLoop(const KernelParams params)
             lossGradient[i] = __float2half(loss);
         }
 
-        // BackwardPass(lossGradient, params.networkWeights[0], params.networkWeights[1]);
+        tcnn::hvec<NT_INPUT_SIZE> inputsVector(sampledFeatures);
+        BackwardPass<numThreads>(lossGradient,
+                                 activatedHiddenLayer0,
+                                 inputsVector,
+                                 params.networkWeights[0],
+                                 params.networkWeights[1],
+                                 params.networkWeightGradients[0],
+                                 params.networkWeightGradients[1],
+                                 params.networkBiasGradients[0],
+                                 params.networkBiasGradients[1]);
 
         // gradient of loss w.r.t 12 inputs
     }

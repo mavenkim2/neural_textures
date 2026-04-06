@@ -62,6 +62,11 @@ NT_HOST_DEVICE inline float3 operator/(const float3 &a, float b)
     return make_float3(a.x / b, a.y / b, a.z / b);
 }
 
+NT_HOST_DEVICE inline float Dot(const float3 &a, const float3 &b)
+{
+    return a.x * b.x + a.y * b.y + a.z * b.z;
+}
+
 NT_HOST_DEVICE inline float3 Floor(const float3 &value)
 {
     return make_float3(floorf(value.x), floorf(value.y), floorf(value.z));
