@@ -387,6 +387,8 @@ NT_DEVICE void TrainLoop(const KernelParams params)
                                  params.networkBiasGradients[0],
                                  params.networkBiasGradients[1]);
 
+        // BackwardFeaturePass(params, make_float3(u, v, s), half * inputGradient);
+
         // gradient of loss w.r.t 12 inputs
     }
 }

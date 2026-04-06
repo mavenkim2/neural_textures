@@ -7,6 +7,8 @@
 #include <cuda_runtime.h>
 #include <vector>
 
+constexpr uint32_t WARP_SIZE = tcnn::WARP_SIZE;
+
 namespace neural_textures
 {
 
@@ -158,13 +160,12 @@ bool RunForwardPassTest()
 
     InitializeForwardPassTestData(
         inputsHost, weightsHidden0Host, weightsHidden1Host, biasesHidden0Host, biasesHidden1Host);
-    ComputeForwardPassReference(
-        inputsHost,
-        weightsHidden0Host,
-        weightsHidden1Host,
-        biasesHidden0Host,
-        biasesHidden1Host,
-        referenceOutputs);
+    ComputeForwardPassReference(inputsHost,
+                                weightsHidden0Host,
+                                weightsHidden1Host,
+                                biasesHidden0Host,
+                                biasesHidden1Host,
+                                referenceOutputs);
 
     half *inputsDevice = nullptr;
     half *weightsHidden0Device = nullptr;
@@ -218,13 +219,12 @@ bool RunForwardPassTest()
 
     if (success)
     {
-        ForwardPassTestKernel<<<1, WARP_SIZE>>>(
-            outputsDevice,
-            inputsDevice,
-            weightsHidden0Device,
-            weightsHidden1Device,
-            biasesHidden0Device,
-            biasesHidden1Device);
+        ForwardPassTestKernel<<<1, WARP_SIZE>>>(outputsDevice,
+                                                inputsDevice,
+                                                weightsHidden0Device,
+                                                weightsHidden1Device,
+                                                biasesHidden0Device,
+                                                biasesHidden1Device);
         success =
             CheckCuda(cudaGetLastError(), "ForwardPassTestKernel launch") &&
             CheckCuda(cudaDeviceSynchronize(), "ForwardPassTestKernel sync") &&

@@ -1,5 +1,6 @@
 #pragma once
 
+#include "util/cuda_util.h"
 #include <cuda_fp16.h>
 #include <tiny-cuda-nn/mma.h>
 
@@ -7,7 +8,6 @@
 #define NT_DEVICE __device__
 #endif
 
-#define WARP_SIZE 32
 #define NT_INPUT_SIZE 12
 #define NT_HIDDEN_LAYER_SIZE 16
 #define NT_OUTPUT_SIZE 8
@@ -26,7 +26,7 @@ ForwardPass(const half *sampledFeatures,
             tcnn::hvec<NT_HIDDEN_LAYER_SIZE> *activatedHiddenLayer0 = 0)
 {
     tcnn::hvec<NT_INPUT_SIZE> inputsVector0(sampledFeatures);
-    tcnn::mma_mat<WARP_SIZE, 16, tcnn::RM> inputsMatrix0(inputsVector0);
+    tcnn::mma_vec<16> inputsMatrix0(inputsVector0);
 
     tcnn::mma_mat<16, 16, tcnn::CM> weightsHiddenLayer0 =
         tcnn::mma_mat<16, 16, tcnn::CM>::from_linear_memory(weightsLayer0);
@@ -52,31 +52,88 @@ ForwardPass(const half *sampledFeatures,
     return finalOutput.vec<NT_OUTPUT_SIZE>();
 }
 
+template <uint32_t N_THREADS, uint32_t N>
+__device__ void SumRows(const tcnn::mma_vec<16> &grad_mat,
+                        float *shared_partials, // size: (N_THREADS / 32) * 16
+                        float *global_bias_grad // size: 16
+)
+{
+    constexpr uint32_t N_WARPS = N_THREADS / 32;
+    const uint32_t lane = threadIdx.x & 31;
+    const uint32_t warp = threadIdx.x >> 5;
+
+    tcnn::hvec<16> row = grad_mat.vec<16>();
+
+    float accum[N];
+#pragma unroll
+    for (int i = 0; i < N; ++i)
+    {
+        accum[i] = __half2float(row[i]);
+    }
+
+#pragma unroll
+    for (int i = 0; i < N; ++i)
+    {
+        accum[i] = WarpReduceSum(accum[i]);
+    }
+
+    if (lane == 0)
+    {
+#pragma unroll
+        for (int i = 0; i < N; ++i)
+        {
+            shared_partials[warp * N + i] = accum[i];
+        }
+    }
+
+    __syncthreads();
+
+    if (warp == 0)
+    {
+#pragma unroll
+        for (int i = 0; i < N; ++i)
+        {
+            float val = lane < N_WARPS ? shared_partials[lane * N + i] : 0.f;
+            val = WarpReduceSum(val);
+            if (lane == 0)
+            {
+                atomicAdd(&global_bias_grad[i], val);
+            }
+        }
+    }
+
+    __syncthreads();
+}
+
 template <uint32_t numThreads>
 NT_DEVICE inline auto BackwardPass(const tcnn::hvec<NT_OUTPUT_SIZE> &lossGradientVector,
                                    const tcnn::hvec<NT_HIDDEN_LAYER_SIZE> &activatedHiddenLayer0,
                                    const tcnn::hvec<NT_INPUT_SIZE> &networkInput,
                                    const half *weightsHidden0,
                                    const half *weightsHidden1,
-                                   half *layer0WeightGradients,
-                                   half *layer1WeightGradients,
-                                   half *layer0BiasGradients,
-                                   half *layer1BiasGradients)
+                                   float *layer0WeightGradients,
+                                   float *layer1WeightGradients,
+                                   float *layer0BiasGradients,
+                                   float *layer1BiasGradients)
 {
+    extern __shared__ float shmem[];
     tcnn::mma_vec<16> lossGradientMatrix(lossGradientVector); // 32x8
-    tcnn::mma_mat<16, 16, tcnn::CM> weightsOutput =
-        tcnn::mma_mat<16, 16, tcnn::CM>::from_linear_memory(weightsHidden1);    // 16x8
-    auto hiddenGradientMatrix = lossGradientMatrix * weightsOutput.transpose(); // 32x16
+    // TODO IMPORTANT: NT_OUTPUT_SIZE can change based on the number of outputs
+    SumRows<numThreads, NT_OUTPUT_SIZE>(lossGradientMatrix, shmem, layer1BiasGradients);
 
+    tcnn::mma_mat<16, 16, tcnn::CM> weightsOutput =
+        tcnn::mma_mat<16, 16, tcnn::CM>::from_linear_memory(weightsHidden1);     // 16x8
+    auto hiddenGradientMatrix = lossGradientMatrix * weightsOutput.transpose();  // 32x16
     tcnn::mma_vec<NT_HIDDEN_LAYER_SIZE> outputLayerInput(activatedHiddenLayer0); // 32x16
     hiddenGradientMatrix.activate_bwd<tcnn::Activation::ReLU>(outputLayerInput);
+    SumRows<numThreads, NT_HIDDEN_LAYER_SIZE>(hiddenGradientMatrix, shmem, layer0BiasGradients);
+
     auto outputWeightGradientMatrix =
         tcnn::outer_product(outputLayerInput, lossGradientMatrix); // 16x8
 
     // Write to memory
     outputWeightGradientMatrix.sum_into_linear_global_memory_hierarchical<numThreads>(
         layer1WeightGradients);
-    // lossGradientVector.to_linear_memory(outputLayerBiasGradients);
 
     tcnn::mma_mat<16, 16, tcnn::CM> weightsHiddenLayer0 =
         tcnn::mma_mat<16, 16, tcnn::CM>::from_linear_memory(weightsHidden0);           // 12x16
@@ -86,8 +143,8 @@ NT_DEVICE inline auto BackwardPass(const tcnn::hvec<NT_OUTPUT_SIZE> &lossGradien
     auto hiddenWeightGradientMatrix =
         tcnn::outer_product(networkInputMatrix, hiddenGradientMatrix); // 12x16
     hiddenWeightGradientMatrix.sum_into_linear_global_memory_hierarchical<numThreads>(
-        layer1WeightGradients);
-    //
+        layer0WeightGradients);
+
     return inputGradientMatrix;
 }
 
@@ -108,12 +165,12 @@ inline T Lerp(T x, T y, T s)
 NT_DEVICE inline void AdamOptimize(AdamConstants &constants,
                                    float &moment1,
                                    float &moment2,
+                                   float gradient,
                                    float learningRate,
                                    float invBiasCorrection,
                                    float epsilon,
                                    float weight)
 {
-    float gradient;
     float firstMoment = Lerp(gradient, moment1, constants.beta1);
     float secondMoment = Lerp(gradient * gradient, moment2, constants.beta2);
 
