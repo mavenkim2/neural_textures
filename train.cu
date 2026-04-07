@@ -75,10 +75,10 @@ struct KernelParams
 
     // NOTE: padded to 16x16
     half *networkWeights[gNumNetworkLayers];
-    half *networkWeightGradients[gNumNetworkLayers];
+    float *networkWeightGradients[gNumNetworkLayers];
 
     half *networkBiases[gNumNetworkLayers];
-    half *networkBiasGradients[gNumNetworkLayers];
+    float *networkBiasGradients[gNumNetworkLayers];
 
     int imageWidth;
     int imageHeight;
@@ -240,7 +240,9 @@ SampleFourFeaturesTrilinear(const KernelParams &params, float3 uvs, half *outFea
     }
 }
 
-NT_DEVICE inline void BackwardFeaturePass(KernelParams &params, float3 uvs, half *inputGradient)
+NT_DEVICE inline void BackwardFeaturePass(KernelParams &params,
+                                          float3 uvs,
+                                          const tcnn::hvec<NT_INPUT_SIZE> &inputGradient)
 {
     int mipBase = (int)floorf(uvs.z);
     float mipFrac = uvs.z - floorf(uvs.z);
@@ -334,7 +336,7 @@ NT_DEVICE inline void BackwardFeaturePass(KernelParams &params, float3 uvs, half
 // 6. Update latents (since BC6 is differentiable)
 
 template <uint32_t numThreads>
-NT_DEVICE void TrainLoop(const KernelParams params)
+NT_DEVICE void TrainLoop(KernelParams params)
 {
     const uint32_t threadID = threadIdx.y * blockDim.x + threadIdx.x;
     (void)threadID;
@@ -377,17 +379,18 @@ NT_DEVICE void TrainLoop(const KernelParams params)
         }
 
         tcnn::hvec<NT_INPUT_SIZE> inputsVector(sampledFeatures);
-        BackwardPass<numThreads>(lossGradient,
-                                 activatedHiddenLayer0,
-                                 inputsVector,
-                                 params.networkWeights[0],
-                                 params.networkWeights[1],
-                                 params.networkWeightGradients[0],
-                                 params.networkWeightGradients[1],
-                                 params.networkBiasGradients[0],
-                                 params.networkBiasGradients[1]);
+        tcnn::hvec<NT_INPUT_SIZE> inputGradient =
+            BackwardPass<numThreads>(lossGradient,
+                                     activatedHiddenLayer0,
+                                     inputsVector,
+                                     params.networkWeights[0],
+                                     params.networkWeights[1],
+                                     params.networkWeightGradients[0],
+                                     params.networkWeightGradients[1],
+                                     params.networkBiasGradients[0],
+                                     params.networkBiasGradients[1]);
 
-        // BackwardFeaturePass(params, make_float3(u, v, s), half * inputGradient);
+        BackwardFeaturePass(params, make_float3(u, v, s), inputGradient);
 
         // gradient of loss w.r.t 12 inputs
     }
