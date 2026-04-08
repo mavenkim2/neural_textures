@@ -6,13 +6,10 @@
 
 #include "mlp.h"
 
+#include "train.h"
 #include "util/atomic.h"
 #include "util/float2.h"
 #include "util/float3.h"
-
-static const int gNumFeatures = 4;
-static const int gNumBC6PixelsPerBlock = 16;
-static const int gNumIters = 5000;
 
 namespace neural_textures
 {
@@ -41,52 +38,6 @@ struct RNG
     {
         return 0.f;
     }
-};
-
-struct BC6Parameters
-{
-    float3 endpoints[4];
-    float pixelIndices[gNumBC6PixelsPerBlock]; // [0, 1]
-    int partition;
-    int mode;
-};
-
-struct BC6ParameterGradients
-{
-    float3 endpoints[4];
-    float pixelIndices[gNumBC6PixelsPerBlock];
-};
-
-struct Feature
-{
-    BC6Parameters **grid;
-    BC6ParameterGradients **gradients;
-
-    int width; // in texels
-    int height;
-};
-
-static const int gNumNetworkLayers = 2;
-
-struct KernelParams
-{
-    // params[mip][v * numU + u]
-    Feature features[gNumFeatures];
-
-    // NOTE: padded to 16x16
-    half *networkWeights[gNumNetworkLayers];
-    float *networkWeightGradients[gNumNetworkLayers];
-
-    half *networkBiases[gNumNetworkLayers];
-    float *networkBiasGradients[gNumNetworkLayers];
-
-    int imageWidth;
-    int imageHeight;
-    int numMips;
-    int numBlocksU;
-    int numBlocksV;
-
-    int numSamples;
 };
 
 NT_DEVICE inline float Clamp(float x, float low, float high)
@@ -191,14 +142,14 @@ SampleFourFeaturesTrilinear(const KernelParams &params, float3 uvs, half *outFea
     int mipBase = (int)floorf(uvs.z);
     float mipFrac = uvs.z - floorf(uvs.z);
 
-    for (int featureIndex = 0; featureIndex < gNumFeatures * 3; ++featureIndex)
+    for (int featureIndex = 0; featureIndex < NT_NUM_FEATURES * 3; ++featureIndex)
     {
         outFeatures[featureIndex] = 0;
     }
 
     // TODO: consider reordering loads/global memory accesses
 
-    for (int featureIndex = 0; featureIndex < gNumFeatures; ++featureIndex)
+    for (int featureIndex = 0; featureIndex < NT_NUM_FEATURES; ++featureIndex)
     {
         const Feature &feature = params.features[featureIndex];
         for (int mipIndex = 0; mipIndex <= 1; mipIndex++)
@@ -248,7 +199,7 @@ NT_DEVICE inline void BackwardFeaturePass(KernelParams &params,
     float mipFrac = uvs.z - floorf(uvs.z);
 
     // TODO: consider reordering loads/global memory accesses
-    for (int featureIndex = 0; featureIndex < gNumFeatures; ++featureIndex)
+    for (int featureIndex = 0; featureIndex < NT_NUM_FEATURES; ++featureIndex)
     {
         Feature &feature = params.features[featureIndex];
         for (int mipIndex = 0; mipIndex <= 1; mipIndex++)
@@ -335,6 +286,96 @@ NT_DEVICE inline void BackwardFeaturePass(KernelParams &params,
 // 5. Adam/update weights
 // 6. Update latents (since BC6 is differentiable)
 
+NT_DEVICE inline void AdamUpdateParameter(float &moment1,
+                                          float &moment2,
+                                          float gradient,
+                                          const AdamConstants &adam,
+                                          int step,
+                                          half &weight)
+{
+    const int currentStep = step > 0 ? step : 1;
+    const float beta1 = adam.beta1;
+    const float beta2 = adam.beta2;
+    const float biasCorrection1 = 1.f - powf(beta1, (float)currentStep);
+    const float biasCorrection2 = 1.f - powf(beta2, (float)currentStep);
+
+    moment1 = beta1 * moment1 + (1.f - beta1) * gradient;
+    moment2 = beta2 * moment2 + (1.f - beta2) * gradient * gradient;
+
+    const float mhat = moment1 / biasCorrection1;
+    const float vhat = moment2 / biasCorrection2;
+    const float weightValue = __half2float(weight);
+    const float newWeight = weightValue - adam.learningRate * mhat / (sqrtf(vhat) + adam.epsilon);
+
+    weight = __float2half(newWeight);
+}
+
+NT_DEVICE inline void OptimizeParameterBuffer(half *weights,
+                                              float *gradients,
+                                              float *moment1,
+                                              float *moment2,
+                                              int count,
+                                              const AdamConstants &adam,
+                                              int step)
+{
+    const int threadId = blockIdx.x * blockDim.x + threadIdx.x;
+    const int threadCount = gridDim.x * blockDim.x;
+
+    for (int i = threadId; i < count; i += threadCount)
+    {
+        const float gradient = gradients[i];
+        if (gradient == 0.f)
+        {
+            continue;
+        }
+
+        AdamUpdateParameter(moment1[i], moment2[i], gradient, adam, step, weights[i]);
+        gradients[i] = 0.f;
+    }
+}
+
+NT_DEVICE inline void OptimizeNetworkPass(KernelParams params)
+{
+    constexpr int weightCounts[NT_NUM_NETWORK_LAYERS] = {
+        NT_HIDDEN_LAYER_SIZE * NT_INPUT_SIZE,
+        NT_HIDDEN_LAYER_SIZE * NT_HIDDEN_LAYER_SIZE,
+    };
+    constexpr int biasCounts[NT_NUM_NETWORK_LAYERS] = {
+        NT_HIDDEN_LAYER_SIZE,
+        NT_HIDDEN_LAYER_SIZE,
+    };
+
+    for (int layer = 0; layer < NT_NUM_NETWORK_LAYERS; ++layer)
+    {
+        OptimizeParameterBuffer(params.networkWeights[layer],
+                                params.networkWeightGradients[layer],
+                                params.networkWeightMoment1[layer],
+                                params.networkWeightMoment2[layer],
+                                weightCounts[layer],
+                                params.networkAdam,
+                                params.step);
+
+        OptimizeParameterBuffer(params.networkBiases[layer],
+                                params.networkBiasGradients[layer],
+                                params.networkBiasMoment1[layer],
+                                params.networkBiasMoment2[layer],
+                                biasCounts[layer],
+                                params.networkAdam,
+                                params.step);
+    }
+}
+
+__global__ void OptimizeNetwork(KernelParams params)
+{
+    OptimizeNetworkPass(params);
+}
+
+void InvokeOptimizeNetwork(KernelParams &params)
+{
+    OptimizeNetwork<<<1, 32>>>(params);
+    params.step++;
+}
+
 template <uint32_t numThreads>
 NT_DEVICE void TrainLoop(KernelParams params)
 {
@@ -342,13 +383,12 @@ NT_DEVICE void TrainLoop(KernelParams params)
     (void)threadID;
     RNG rng;
 
-    // for (int iter = 0; iter < gNumIters; iter++)
     {
         float u = rng.UniformFloat();
         float v = rng.UniformFloat();
         float s = rng.UniformFloat();
 
-        half sampledFeatures[gNumFeatures * 3];
+        half sampledFeatures[NT_NUM_FEATURES * 3];
         SampleFourFeaturesTrilinear(params, make_float3(u, v, s), sampledFeatures);
 
         // TODO: feed the four sampled feature vectors into the MLP, compare against the
@@ -391,11 +431,7 @@ NT_DEVICE void TrainLoop(KernelParams params)
                                      params.networkBiasGradients[1]);
 
         BackwardFeaturePass(params, make_float3(u, v, s), inputGradient);
-
-        // gradient of loss w.r.t 12 inputs
     }
 }
-
-NT_DEVICE void OptimizePass(const KernelParams params) {}
 
 } // namespace neural_textures

@@ -1,18 +1,13 @@
 #pragma once
 
+#include "train.h"
 #include "util/cuda_util.h"
-#include <cuda_fp16.h>
+#include <cmath>
 #include <tiny-cuda-nn/mma.h>
 
 #if defined(__CUDACC__)
 #define NT_DEVICE __device__
 #endif
-
-#define NT_INPUT_SIZE 12
-#define NT_HIDDEN_LAYER_SIZE 16
-#define NT_OUTPUT_SIZE 8
-
-#define half __half
 
 namespace neural_textures
 {
@@ -188,7 +183,8 @@ BackwardPass(const tcnn::hvec<NT_OUTPUT_SIZE> &lossGradientVector,
     constexpr uint32_t maxBiasSharedFloats = numWarps * NT_HIDDEN_LAYER_SIZE;
     constexpr uint32_t maxWeightSharedFloats =
         (numWarps > 1 ? (numWarps / 2) * tcnn::mma_mat<16, 16, tcnn::CM>::N_ELEMS : 0);
-    constexpr uint32_t shmemFloats = max(maxBiasSharedFloats, maxWeightSharedFloats);
+    constexpr uint32_t shmemFloats =
+        maxBiasSharedFloats > maxWeightSharedFloats ? maxBiasSharedFloats : maxWeightSharedFloats;
     __shared__ float shmem[shmemFloats > 0 ? shmemFloats : 1];
 
     tcnn::mma_vec<16> lossGradientMatrix(lossGradientVector); // 32x8
@@ -220,38 +216,6 @@ BackwardPass(const tcnn::hvec<NT_OUTPUT_SIZE> &lossGradientVector,
         hiddenWeightGradientMatrix, shmem, layer0WeightGradients);
 
     return inputGradientMatrix.vec<NT_INPUT_SIZE>();
-}
-
-struct AdamConstants
-{
-    float beta1;
-    float beta2;
-    float learningRate;
-    float decay;
-};
-
-template <typename T>
-inline T Lerp(T x, T y, T s)
-{
-    return (T(1) - s) * x + s * y;
-}
-
-NT_DEVICE inline void AdamOptimize(AdamConstants &constants,
-                                   float &moment1,
-                                   float &moment2,
-                                   float gradient,
-                                   float learningRate,
-                                   float invBiasCorrection,
-                                   float epsilon,
-                                   float weight)
-{
-    float firstMoment = Lerp(gradient, moment1, constants.beta1);
-    float secondMoment = Lerp(gradient * gradient, moment2, constants.beta2);
-
-    // TODO: potential variant is to not correct first moment?
-    float mhat = firstMoment * invBiasCorrection;
-    float vhat = secondMoment * invBiasCorrection;
-    float newWeight = weight - learningRate * mhat / (sqrtf(vhat) + epsilon);
 }
 
 } // namespace neural_textures
