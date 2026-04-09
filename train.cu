@@ -295,6 +295,57 @@ NT_DEVICE inline void BackwardFeaturePass(KernelParams &params,
     }
 }
 
+NT_DEVICE inline void BackwardUnconstrainedFeaturePass(
+    KernelParams &params, float3 uvs, const tcnn::hvec<NT_INPUT_SIZE> &inputGradient)
+{
+    int mipBase = (int)floorf(uvs.z);
+    float mipFrac = uvs.z - floorf(uvs.z);
+
+    // TODO: consider reordering loads/global memory accesses
+    for (int featureIndex = 0; featureIndex < NT_NUM_FEATURES; ++featureIndex)
+    {
+        Feature &feature = params.features[featureIndex];
+        for (int mipIndex = 0; mipIndex <= 1; mipIndex++)
+        {
+            int mip = mipBase + mipIndex;
+            int width = max(feature.width >> mip, 1);
+            int height = max(feature.height >> mip, 1);
+            int numBlocksU = max(1, width >> 2);
+
+            float2 imageSize = make_float2(float(width), float(height));
+            float2 texelUV = make_float2(uvs.x, uvs.y) * imageSize - 0.5f;
+            float2 texelBaseUV = Floor(texelUV);
+            int2 texelBase = make_int2(int(texelBaseUV.x), int(texelBaseUV.y));
+            float2 texelFrac = texelUV - texelBaseUV;
+
+            // TODO: unroll?
+            for (int corner = 0; corner < 4; corner++)
+            {
+                int cornerX = corner & 1;
+                int cornerY = corner >> 1;
+
+                int texelX = texelBase.x + cornerX;
+                int texelY = texelBase.y + cornerY;
+                texelX = WrapTexelCoord(texelX, width);
+                texelY = WrapTexelCoord(texelY, height);
+                float weight = (mipIndex ? mipFrac : 1.f - mipFrac) *
+                               BilinearWeight(make_int2(cornerX, cornerY), texelFrac);
+
+                const int pixelIndex = GetBlockPixelIndex(texelX, texelY);
+                const int paramIndex = GetBlockParamIndex(texelX, texelY, numBlocksU);
+
+                float3 *texture = feature.unconstrainedGrid[mip];
+
+                float3 featureGrad =
+                    weight * make_float3(float(inputGradient[3 * featureIndex]),
+                                         float(inputGradient[3 * featureIndex + 1]),
+                                         float(inputGradient[3 * featureIndex + 2]));
+                atomicAdd(texture + paramIndex, featureGrad);
+            }
+        }
+    }
+}
+
 // 1. Sample latents (which also somehow involves BC6 decompress) and reference
 //      a. Train for 5k iterations with "unconstrained parameters" which just means
 //      normal float3s.
@@ -535,7 +586,7 @@ void InvokeOptimizeFeatures(KernelParams &params)
     OptimizeFeatures<<<numBlocks, kThreadsPerBlock>>>(params);
 }
 
-template <uint32_t numThreads>
+template <uint32_t numThreads, TrainingKernelType type>
 NT_DEVICE void TrainLoop(KernelParams params)
 {
     const uint32_t threadID = threadIdx.y * blockDim.x + threadIdx.x;
@@ -546,9 +597,10 @@ NT_DEVICE void TrainLoop(KernelParams params)
         float u = rng.UniformFloat();
         float v = rng.UniformFloat();
         float s = rng.UniformFloat();
+        float3 uvs = make_float3(u, v, s);
 
         half sampledFeatures[NT_NUM_FEATURES * 3];
-        SampleFourFeaturesTrilinear(params, make_float3(u, v, s), sampledFeatures);
+        SampleFourFeaturesTrilinear(params, uvs, sampledFeatures);
 
         // TODO: feed the four sampled feature vectors into the MLP, compare against the
         // filtered reference material sample, and backpropagate into network + BC6 params.
@@ -589,7 +641,14 @@ NT_DEVICE void TrainLoop(KernelParams params)
                                      params.networkBiasGradients[0],
                                      params.networkBiasGradients[1]);
 
-        BackwardFeaturePass(params, make_float3(u, v, s), inputGradient);
+        if constexpr (type == TrainingKernelType::UNCONSTRAINED)
+        {
+            BackwardUnconstrainedFeaturePass(params, uvs, inputGradient);
+        }
+        else if constexpr (type == TrainingKernelType::BLOCK_FEATURES)
+        {
+            BackwardFeaturePass(params, uvs, inputGradient);
+        }
     }
 }
 

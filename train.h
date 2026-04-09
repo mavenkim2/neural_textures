@@ -15,6 +15,13 @@ namespace neural_textures
 #define NT_NUM_BC6_PIXELS_PER_BLOCK 16
 #define NT_NUM_FEATURES 4
 
+enum class TrainingKernelType
+{
+    UNCONSTRAINED,
+    BLOCK_FEATURES,
+    FINALIZE,
+};
+
 struct AdamConstants
 {
     float beta1;
@@ -43,6 +50,12 @@ struct Feature
     BC6ParameterGradients **gradients;
     BC6ParameterGradients **moment1;
     BC6ParameterGradients **moment2;
+
+    // Initial unconstrained features
+    float3 **unconstrainedGrid;
+    float3 **unconstrainedGradients;
+    float3 **unconstrainedMoment1;
+    float3 **unconstrainedMoment2;
 
     int width; // in texels
     int height;
