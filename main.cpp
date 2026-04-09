@@ -43,7 +43,10 @@ struct HostTexture
     std::filesystem::path path;
     int width = 0;
     int height = 0;
-    std::vector<float4> pixels;
+    int numChannels = 0;
+    int cudaChannels = 0;
+    std::vector<std::string> channelNames;
+    std::vector<float> pixels;
 };
 
 struct UploadedTexture
@@ -51,6 +54,8 @@ struct UploadedTexture
     std::filesystem::path path;
     int width = 0;
     int height = 0;
+    int numChannels = 0;
+    int cudaChannels = 0;
     cudaArray_t array = nullptr;
     cudaTextureObject_t texture = 0;
 };
@@ -63,17 +68,40 @@ void CheckCuda(cudaError_t result, const char *operation)
     }
 }
 
+int GetCudaChannelCount(int numChannels)
+{
+    if (numChannels == 3)
+    {
+        return 4;
+    }
+
+    return numChannels;
+}
+
 HostTexture LoadExrTexture(const std::filesystem::path &path)
 {
-    float *rgbaData = nullptr;
-    int width = 0;
-    int height = 0;
+    EXRVersion exrVersion;
+    EXRHeader exrHeader;
+
+    InitEXRHeader(&exrHeader);
+
     const char *errorMessage = nullptr;
 
-    const int loadResult = LoadEXR(&rgbaData, &width, &height, path.string().c_str(), &errorMessage);
-    if (loadResult != TINYEXR_SUCCESS)
+    int result = ParseEXRVersionFromFile(&exrVersion, path.string().c_str());
+    if (result != TINYEXR_SUCCESS)
     {
-        std::string message = "Failed to load EXR";
+        throw std::runtime_error("Failed to parse EXR version: " + path.string());
+    }
+
+    if (exrVersion.multipart || exrVersion.non_image)
+    {
+        throw std::runtime_error("Multipart or non-image EXRs are not supported: " + path.string());
+    }
+
+    result = ParseEXRHeaderFromFile(&exrHeader, &exrVersion, path.string().c_str(), &errorMessage);
+    if (result != TINYEXR_SUCCESS)
+    {
+        std::string message = "Failed to parse EXR header";
         if (errorMessage)
         {
             message += ": ";
@@ -83,22 +111,91 @@ HostTexture LoadExrTexture(const std::filesystem::path &path)
         throw std::runtime_error(message);
     }
 
+    for (int channelIndex = 0; channelIndex < exrHeader.num_channels; ++channelIndex)
+    {
+        if (exrHeader.pixel_types[channelIndex] == TINYEXR_PIXELTYPE_HALF)
+        {
+            exrHeader.requested_pixel_types[channelIndex] = TINYEXR_PIXELTYPE_FLOAT;
+        }
+    }
+
+    float *rgbaData = nullptr;
+    int width = 0;
+    int height = 0;
+    result = LoadEXR(&rgbaData, &width, &height, path.string().c_str(), &errorMessage);
+    if (result != TINYEXR_SUCCESS)
+    {
+        std::string message = "Failed to load EXR image";
+        if (errorMessage)
+        {
+            message += ": ";
+            message += errorMessage;
+            FreeEXRErrorMessage(errorMessage);
+        }
+
+        FreeEXRHeader(&exrHeader);
+        throw std::runtime_error(message);
+    }
+
+    if (exrHeader.num_channels != 1 && exrHeader.num_channels != 3 && exrHeader.num_channels != 4)
+    {
+        std::free(rgbaData);
+        FreeEXRHeader(&exrHeader);
+        throw std::runtime_error("Unsupported EXR channel count " +
+                                 std::to_string(exrHeader.num_channels) + ": " + path.string());
+    }
+
     HostTexture texture;
     texture.path = path;
     texture.width = width;
     texture.height = height;
-    texture.pixels.resize((size_t)width * (size_t)height);
+    texture.numChannels = exrHeader.num_channels;
+    texture.cudaChannels = GetCudaChannelCount(texture.numChannels);
+    texture.pixels.resize((size_t)texture.width * (size_t)texture.height *
+                          (size_t)texture.cudaChannels);
+    texture.channelNames.reserve((size_t)texture.numChannels);
 
-    for (size_t pixelIndex = 0; pixelIndex < texture.pixels.size(); ++pixelIndex)
+    for (int channelIndex = 0; channelIndex < texture.numChannels; ++channelIndex)
     {
-        texture.pixels[pixelIndex] = make_float4(rgbaData[4 * pixelIndex + 0],
-                                                 rgbaData[4 * pixelIndex + 1],
-                                                 rgbaData[4 * pixelIndex + 2],
-                                                 rgbaData[4 * pixelIndex + 3]);
+        texture.channelNames.emplace_back(exrHeader.channels[channelIndex].name);
+    }
+
+    const size_t pixelCount = (size_t)texture.width * (size_t)texture.height;
+    for (size_t pixelIndex = 0; pixelIndex < pixelCount; ++pixelIndex)
+    {
+        if (texture.numChannels == 1)
+        {
+            texture.pixels[pixelIndex] = rgbaData[4 * pixelIndex + 0];
+        }
+        else
+        {
+            for (int channelIndex = 0; channelIndex < texture.numChannels; ++channelIndex)
+            {
+                texture.pixels[pixelIndex * (size_t)texture.cudaChannels + (size_t)channelIndex] =
+                    rgbaData[4 * pixelIndex + (size_t)channelIndex];
+            }
+
+            if (texture.numChannels == 3)
+            {
+                texture.pixels[pixelIndex * (size_t)texture.cudaChannels + 3] = 1.f;
+            }
+        }
     }
 
     std::free(rgbaData);
+    FreeEXRHeader(&exrHeader);
     return texture;
+}
+
+cudaChannelFormatDesc CreateChannelDesc(int numChannels)
+{
+    cudaChannelFormatDesc desc = {};
+    desc.f = cudaChannelFormatKindFloat;
+    desc.x = 32;
+    desc.y = numChannels >= 2 ? 32 : 0;
+    desc.z = numChannels >= 3 ? 32 : 0;
+    desc.w = numChannels >= 4 ? 32 : 0;
+    return desc;
 }
 
 UploadedTexture UploadTexture(const HostTexture &hostTexture)
@@ -107,15 +204,18 @@ UploadedTexture UploadTexture(const HostTexture &hostTexture)
     uploadedTexture.path = hostTexture.path;
     uploadedTexture.width = hostTexture.width;
     uploadedTexture.height = hostTexture.height;
+    uploadedTexture.numChannels = hostTexture.numChannels;
+    uploadedTexture.cudaChannels = hostTexture.cudaChannels;
 
-    cudaChannelFormatDesc channelDesc = cudaCreateChannelDesc<float4>();
+    cudaChannelFormatDesc channelDesc = CreateChannelDesc(hostTexture.cudaChannels);
     CheckCuda(cudaMallocArray(&uploadedTexture.array,
                               &channelDesc,
                               (size_t)hostTexture.width,
                               (size_t)hostTexture.height),
               "cudaMallocArray");
 
-    const size_t rowPitch = (size_t)hostTexture.width * sizeof(float4);
+    const size_t rowPitch = (size_t)hostTexture.width * (size_t)hostTexture.cudaChannels *
+                            sizeof(float);
     CheckCuda(cudaMemcpy2DToArray(uploadedTexture.array,
                                   0,
                                   0,
@@ -218,10 +318,13 @@ int main(int argc, char *argv[])
 
         for (const UploadedTexture &texture : uploadedTextures)
         {
-            std::printf("Loaded %s (%dx%d) -> cudaTextureObject_t=%llu\n",
+            std::printf("Loaded %s (%dx%d, %d channel%s, cuda=%d) -> cudaTextureObject_t=%llu\n",
                         texture.path.string().c_str(),
                         texture.width,
                         texture.height,
+                        texture.numChannels,
+                        texture.numChannels == 1 ? "" : "s",
+                        texture.cudaChannels,
                         (unsigned long long)texture.texture);
         }
 
