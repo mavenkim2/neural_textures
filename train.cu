@@ -113,6 +113,25 @@ NT_DEVICE inline int GetBlockPixelIndex(int texelX, int texelY)
     return ((texelY & 0x3) << 2) + (texelX & 0x3);
 }
 
+NT_HOST_DEVICE inline int GetMipDimension(int size, int mip)
+{
+    int dimension = size >> mip;
+    return dimension > 0 ? dimension : 1;
+}
+
+NT_HOST_DEVICE inline int GetBlockCountForDimension(int size)
+{
+    int numBlocks = size >> 2;
+    return numBlocks > 0 ? numBlocks : 1;
+}
+
+NT_HOST_DEVICE inline int GetNumBlocksAtMip(const Feature &feature, int mip)
+{
+    int width = GetMipDimension(feature.width, mip);
+    int height = GetMipDimension(feature.height, mip);
+    return GetBlockCountForDimension(width) * GetBlockCountForDimension(height);
+}
+
 NT_DEVICE inline float3 SampleBC6FeatureTexel(const BC6Parameters *texture,
                                               int numBlocksU,
                                               int imageWidth,
@@ -310,6 +329,27 @@ NT_DEVICE inline void AdamUpdateParameter(float &moment1,
     weight = __float2half(newWeight);
 }
 
+NT_DEVICE inline void AdamUpdateFloatParameter(float &moment1,
+                                               float &moment2,
+                                               float gradient,
+                                               const AdamConstants &adam,
+                                               int step,
+                                               float &weight)
+{
+    const int currentStep = step > 0 ? step : 1;
+    const float beta1 = adam.beta1;
+    const float beta2 = adam.beta2;
+    const float biasCorrection1 = 1.f - powf(beta1, (float)currentStep);
+    const float biasCorrection2 = 1.f - powf(beta2, (float)currentStep);
+
+    moment1 = beta1 * moment1 + (1.f - beta1) * gradient;
+    moment2 = beta2 * moment2 + (1.f - beta2) * gradient * gradient;
+
+    const float mhat = moment1 / biasCorrection1;
+    const float vhat = moment2 / biasCorrection2;
+    weight -= adam.learningRate * mhat / (sqrtf(vhat) + adam.epsilon);
+}
+
 NT_DEVICE inline void OptimizeParameterBuffer(half *weights,
                                               float *gradients,
                                               float *moment1,
@@ -334,15 +374,71 @@ NT_DEVICE inline void OptimizeParameterBuffer(half *weights,
     }
 }
 
+NT_DEVICE inline void OptimizeFeatureScalar(float &weight,
+                                            float &gradient,
+                                            float &moment1,
+                                            float &moment2,
+                                            const AdamConstants &adam,
+                                            int step)
+{
+    if (gradient == 0.f)
+    {
+        return;
+    }
+
+    AdamUpdateFloatParameter(moment1, moment2, gradient, adam, step, weight);
+    gradient = 0.f;
+}
+
+NT_DEVICE inline void OptimizeFeatureBlock(BC6Parameters &parameters,
+                                           BC6ParameterGradients &gradients,
+                                           BC6ParameterGradients &moment1,
+                                           BC6ParameterGradients &moment2,
+                                           const AdamConstants &adam,
+                                           int step)
+{
+    for (int endpointIndex = 0; endpointIndex < 4; ++endpointIndex)
+    {
+        OptimizeFeatureScalar(parameters.endpoints[endpointIndex].x,
+                              gradients.endpoints[endpointIndex].x,
+                              moment1.endpoints[endpointIndex].x,
+                              moment2.endpoints[endpointIndex].x,
+                              adam,
+                              step);
+        OptimizeFeatureScalar(parameters.endpoints[endpointIndex].y,
+                              gradients.endpoints[endpointIndex].y,
+                              moment1.endpoints[endpointIndex].y,
+                              moment2.endpoints[endpointIndex].y,
+                              adam,
+                              step);
+        OptimizeFeatureScalar(parameters.endpoints[endpointIndex].z,
+                              gradients.endpoints[endpointIndex].z,
+                              moment1.endpoints[endpointIndex].z,
+                              moment2.endpoints[endpointIndex].z,
+                              adam,
+                              step);
+    }
+
+    for (int pixelIndex = 0; pixelIndex < NT_NUM_BC6_PIXELS_PER_BLOCK; ++pixelIndex)
+    {
+        OptimizeFeatureScalar(parameters.pixelIndices[pixelIndex],
+                              gradients.pixelIndices[pixelIndex],
+                              moment1.pixelIndices[pixelIndex],
+                              moment2.pixelIndices[pixelIndex],
+                              adam,
+                              step);
+    }
+}
+
 NT_DEVICE inline void OptimizeNetworkPass(KernelParams params)
 {
     constexpr int weightCounts[NT_NUM_NETWORK_LAYERS] = {
         NT_HIDDEN_LAYER_SIZE * NT_INPUT_SIZE,
-        NT_HIDDEN_LAYER_SIZE * NT_HIDDEN_LAYER_SIZE,
+        NT_HIDDEN_LAYER_SIZE * NT_OUTPUT_SIZE,
     };
     constexpr int biasCounts[NT_NUM_NETWORK_LAYERS] = {
         NT_HIDDEN_LAYER_SIZE,
-        NT_HIDDEN_LAYER_SIZE,
+        NT_OUTPUT_SIZE,
     };
 
     for (int layer = 0; layer < NT_NUM_NETWORK_LAYERS; ++layer)
@@ -365,15 +461,78 @@ NT_DEVICE inline void OptimizeNetworkPass(KernelParams params)
     }
 }
 
+NT_DEVICE inline void OptimizeFeaturePass(KernelParams params)
+{
+    const int linearThreadIndex = blockIdx.x * blockDim.x + threadIdx.x;
+    const int threadCount = gridDim.x * blockDim.x;
+    int baseBlockIndex = 0;
+
+    for (int featureIndex = 0; featureIndex < NT_NUM_FEATURES; ++featureIndex)
+    {
+        Feature &feature = params.features[featureIndex];
+        for (int mip = 0; mip < params.numMips; ++mip)
+        {
+            const int numBlocks = GetNumBlocksAtMip(feature, mip);
+            const int segmentEnd = baseBlockIndex + numBlocks;
+
+            for (int linearBlockIndex = linearThreadIndex; linearBlockIndex < segmentEnd;
+                 linearBlockIndex += threadCount)
+            {
+                if (linearBlockIndex < baseBlockIndex)
+                {
+                    continue;
+                }
+
+                const int paramIndex = linearBlockIndex - baseBlockIndex;
+                OptimizeFeatureBlock(feature.grid[mip][paramIndex],
+                                     feature.gradients[mip][paramIndex],
+                                     feature.moment1[mip][paramIndex],
+                                     feature.moment2[mip][paramIndex],
+                                     params.featureAdam,
+                                     params.step);
+            }
+
+            baseBlockIndex = segmentEnd;
+        }
+    }
+}
+
 __global__ void OptimizeNetwork(KernelParams params)
 {
     OptimizeNetworkPass(params);
+}
+
+__global__ void OptimizeFeatures(KernelParams params)
+{
+    OptimizeFeaturePass(params);
 }
 
 void InvokeOptimizeNetwork(KernelParams &params)
 {
     OptimizeNetwork<<<1, 32>>>(params);
     params.step++;
+}
+
+void InvokeOptimizeFeatures(KernelParams &params)
+{
+    int totalBlocks = 0;
+    for (int featureIndex = 0; featureIndex < NT_NUM_FEATURES; ++featureIndex)
+    {
+        const Feature &feature = params.features[featureIndex];
+        for (int mip = 0; mip < params.numMips; ++mip)
+        {
+            totalBlocks += GetNumBlocksAtMip(feature, mip);
+        }
+    }
+
+    if (totalBlocks == 0)
+    {
+        return;
+    }
+
+    constexpr int kThreadsPerBlock = 128;
+    const int numBlocks = (totalBlocks + kThreadsPerBlock - 1) / kThreadsPerBlock;
+    OptimizeFeatures<<<numBlocks, kThreadsPerBlock>>>(params);
 }
 
 template <uint32_t numThreads>

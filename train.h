@@ -1,4 +1,5 @@
 #pragma once
+#include <cstdint>
 #include <cuda_fp16.h>
 
 namespace neural_textures
@@ -40,6 +41,8 @@ struct Feature
 {
     BC6Parameters **grid;
     BC6ParameterGradients **gradients;
+    BC6ParameterGradients **moment1;
+    BC6ParameterGradients **moment2;
 
     int width; // in texels
     int height;
@@ -62,6 +65,7 @@ struct KernelParams
     float *networkBiasMoment2[NT_NUM_NETWORK_LAYERS];
 
     AdamConstants networkAdam;
+    AdamConstants featureAdam;
 
     int imageWidth;
     int imageHeight;
@@ -73,4 +77,5 @@ struct KernelParams
     int step = 0;
 };
 void InvokeOptimizeNetwork(KernelParams &params);
+void InvokeOptimizeFeatures(KernelParams &params);
 } // namespace neural_textures
