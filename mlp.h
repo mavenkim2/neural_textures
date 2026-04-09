@@ -1,13 +1,10 @@
 #pragma once
 
 #include "train.h"
+#include "util/common.h"
 #include "util/cuda_util.h"
 #include <cmath>
 #include <tiny-cuda-nn/mma.h>
-
-#if defined(__CUDACC__)
-#define NT_DEVICE __device__
-#endif
 
 namespace neural_textures
 {

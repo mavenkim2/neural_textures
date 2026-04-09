@@ -1,15 +1,9 @@
 #pragma once
 
-#include "int3.h"
-
+#include "util/common.h"
+#include "util/int3.h"
 #include <cmath>
 #include <cuda_runtime.h>
-
-#if defined(__CUDACC__)
-#define NT_HOST_DEVICE __host__ __device__
-#else
-#define NT_HOST_DEVICE
-#endif
 
 NT_HOST_DEVICE inline float3 make_float3(const int3 &a)
 {
