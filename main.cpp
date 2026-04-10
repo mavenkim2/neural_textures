@@ -8,6 +8,7 @@
 #include <string>
 #include <vector>
 
+#include "train.h"
 #if NT_HAS_CUDA
 #include <cuda_runtime.h>
 
@@ -24,10 +25,9 @@ namespace
 
 std::string ToLower(std::string value)
 {
-    std::transform(value.begin(),
-                   value.end(),
-                   value.begin(),
-                   [](unsigned char c) { return (char)std::tolower(c); });
+    std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) {
+        return (char)std::tolower(c);
+    });
     return value;
 }
 
@@ -64,7 +64,8 @@ void CheckCuda(cudaError_t result, const char *operation)
 {
     if (result != cudaSuccess)
     {
-        throw std::runtime_error(std::string(operation) + " failed: " + cudaGetErrorString(result));
+        throw std::runtime_error(std::string(operation) +
+                                 " failed: " + cudaGetErrorString(result));
     }
 }
 
@@ -95,7 +96,8 @@ HostTexture LoadExrTexture(const std::filesystem::path &path)
 
     if (exrVersion.multipart || exrVersion.non_image)
     {
-        throw std::runtime_error("Multipart or non-image EXRs are not supported: " + path.string());
+        throw std::runtime_error("Multipart or non-image EXRs are not supported: " +
+                                 path.string());
     }
 
     result = ParseEXRHeaderFromFile(&exrHeader, &exrVersion, path.string().c_str(), &errorMessage);
@@ -214,8 +216,8 @@ UploadedTexture UploadTexture(const HostTexture &hostTexture)
                               (size_t)hostTexture.height),
               "cudaMallocArray");
 
-    const size_t rowPitch = (size_t)hostTexture.width * (size_t)hostTexture.cudaChannels *
-                            sizeof(float);
+    const size_t rowPitch =
+        (size_t)hostTexture.width * (size_t)hostTexture.cudaChannels * sizeof(float);
     CheckCuda(cudaMemcpy2DToArray(uploadedTexture.array,
                                   0,
                                   0,
@@ -275,6 +277,8 @@ void DestroyUploadedTextures(std::vector<UploadedTexture> &textures)
 
 } // namespace
 
+using namespace neural_textures;
+
 int main(int argc, char *argv[])
 {
     if (argc < 2)
@@ -302,7 +306,8 @@ int main(int argc, char *argv[])
 
             if (ToLower(path.extension().string()) != ".exr")
             {
-                throw std::runtime_error("Only .exr inputs are supported right now: " + path.string());
+                throw std::runtime_error("Only .exr inputs are supported right now: " +
+                                         path.string());
             }
 
             hostTextures.push_back(LoadExrTexture(path));
@@ -331,10 +336,39 @@ int main(int argc, char *argv[])
         DestroyUploadedTextures(uploadedTextures);
         return 0;
     }
+
     catch (const std::exception &error)
     {
         std::fprintf(stderr, "%s\n", error.what());
         return 1;
+    }
+
+    const int unconstrainedThreshold = 5000;
+    const int blockFeaturesThreshold = unconstrainedThreshold + 200000;
+    const int maxIters = blockFeaturesThreshold + 1000;
+
+    KernelParams params;
+
+    for (int iter = 0; iter < maxIters; iter++)
+    {
+        TrainingKernelType type;
+        if (iter < unconstrainedThreshold)
+        {
+            type = TrainingKernelType::UNCONSTRAINED;
+        }
+        else if (iter < blockFeaturesThreshold)
+        {
+            type = TrainingKernelType::BLOCK_FEATURES;
+        }
+        else
+        {
+            type = TrainingKernelType::FINALIZE;
+        }
+
+        InvokeTraining(params, type);
+        InvokeOptimizeNetwork(params);
+        InvokeOptimizeFeatures(params);
+        params.step++;
     }
 #endif
 }

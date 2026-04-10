@@ -45,7 +45,7 @@ ForwardPass(const half *sampledFeatures,
 }
 
 template <uint32_t N_THREADS, uint32_t N>
-__device__ void SumRows(const tcnn::mma_vec<16> &gradMat,
+__device__ void SumRows(tcnn::mma_vec<16> &gradMat,
                         float *sharedPartials, // size: (N_THREADS / 32) * 16
                         float *globalBiasGrad  // size: 16
 )

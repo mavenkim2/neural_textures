@@ -89,6 +89,7 @@ struct KernelParams
     int numSamples;
     int step = 0;
 };
-void InvokeOptimizeNetwork(KernelParams &params);
-void InvokeOptimizeFeatures(KernelParams &params);
+void InvokeOptimizeNetwork(KernelParams params);
+void InvokeOptimizeFeatures(KernelParams params);
+void InvokeTraining(KernelParams params, TrainingKernelType type);
 } // namespace neural_textures

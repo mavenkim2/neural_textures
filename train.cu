@@ -548,46 +548,8 @@ NT_DEVICE inline void OptimizeFeaturePass(KernelParams params)
     }
 }
 
-__global__ void OptimizeNetwork(KernelParams params)
-{
-    OptimizeNetworkPass(params);
-}
-
-__global__ void OptimizeFeatures(KernelParams params)
-{
-    OptimizeFeaturePass(params);
-}
-
-void InvokeOptimizeNetwork(KernelParams &params)
-{
-    OptimizeNetwork<<<1, 32>>>(params);
-    params.step++;
-}
-
-void InvokeOptimizeFeatures(KernelParams &params)
-{
-    int totalBlocks = 0;
-    for (int featureIndex = 0; featureIndex < NT_NUM_FEATURES; ++featureIndex)
-    {
-        const Feature &feature = params.features[featureIndex];
-        for (int mip = 0; mip < params.numMips; ++mip)
-        {
-            totalBlocks += GetNumBlocksAtMip(feature, mip);
-        }
-    }
-
-    if (totalBlocks == 0)
-    {
-        return;
-    }
-
-    constexpr int kThreadsPerBlock = 128;
-    const int numBlocks = (totalBlocks + kThreadsPerBlock - 1) / kThreadsPerBlock;
-    OptimizeFeatures<<<numBlocks, kThreadsPerBlock>>>(params);
-}
-
 template <uint32_t numThreads, TrainingKernelType type>
-NT_DEVICE void TrainLoop(KernelParams params)
+NT_DEVICE void TrainLoopPass(KernelParams params)
 {
     const uint32_t threadID = threadIdx.y * blockDim.x + threadIdx.x;
     (void)threadID;
@@ -649,6 +611,71 @@ NT_DEVICE void TrainLoop(KernelParams params)
         {
             BackwardFeaturePass(params, uvs, inputGradient);
         }
+    }
+}
+
+__global__ void OptimizeNetwork(KernelParams params)
+{
+    OptimizeNetworkPass(params);
+}
+
+__global__ void OptimizeFeatures(KernelParams params)
+{
+    OptimizeFeaturePass(params);
+}
+
+template <uint32_t numThreads, TrainingKernelType type>
+__global__ void TrainLoop(KernelParams params)
+{
+    TrainLoopPass<numThreads, type>(params);
+}
+
+void InvokeOptimizeNetwork(KernelParams params)
+{
+    OptimizeNetwork<<<1, 32>>>(params);
+}
+
+void InvokeOptimizeFeatures(KernelParams params)
+{
+    int totalBlocks = 0;
+    for (int featureIndex = 0; featureIndex < NT_NUM_FEATURES; ++featureIndex)
+    {
+        const Feature &feature = params.features[featureIndex];
+        for (int mip = 0; mip < params.numMips; ++mip)
+        {
+            totalBlocks += GetNumBlocksAtMip(feature, mip);
+        }
+    }
+
+    if (totalBlocks == 0)
+    {
+        return;
+    }
+
+    constexpr int kThreadsPerBlock = 128;
+    const int numBlocks = (totalBlocks + kThreadsPerBlock - 1) / kThreadsPerBlock;
+    OptimizeFeatures<<<numBlocks, kThreadsPerBlock>>>(params);
+}
+
+void InvokeTraining(KernelParams params, TrainingKernelType type)
+{
+    const int kThreadsPerBlock = 256;
+    const int numSamples = 512 * 512;
+    const int numBlocks = (numSamples + kThreadsPerBlock - 1) / kThreadsPerBlock;
+    if (type == TrainingKernelType::UNCONSTRAINED)
+    {
+        TrainLoop<kThreadsPerBlock, TrainingKernelType::UNCONSTRAINED>
+            <<<numBlocks, kThreadsPerBlock>>>(params);
+    }
+    else if (type == TrainingKernelType::BLOCK_FEATURES)
+    {
+        TrainLoop<kThreadsPerBlock, TrainingKernelType::BLOCK_FEATURES>
+            <<<numBlocks, kThreadsPerBlock>>>(params);
+    }
+    else
+    {
+        TrainLoop<kThreadsPerBlock, TrainingKernelType::FINALIZE>
+            <<<numBlocks, kThreadsPerBlock>>>(params);
     }
 }
 
