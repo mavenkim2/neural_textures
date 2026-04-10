@@ -36,9 +36,24 @@ NT_DEVICE static const int gBC6HPartitionNumBits[] =
 
 struct RNG
 {
+    uint32_t state = 1u;
+
+    NT_DEVICE explicit RNG(uint32_t seed = 1u) : state(seed ? seed : 1u) {}
+
+    NT_DEVICE uint32_t NextUInt()
+    {
+        // xorshift32
+        uint32_t x = state;
+        x ^= x << 13;
+        x ^= x >> 17;
+        x ^= x << 5;
+        state = x;
+        return x;
+    }
+
     NT_DEVICE float UniformFloat()
     {
-        return 0.f;
+        return (float)(NextUInt() & 0x00FFFFFFu) * (1.0f / 16777216.0f);
     }
 };
 
@@ -240,7 +255,8 @@ SampleFourFeaturesTrilinear(const KernelParams &params, float3 uvs, half *outFea
     {
         const Feature &feature = params.features[featureIndex];
         const int maxMip = feature.numMips > 0 ? feature.numMips - 1 : 0;
-        for (int mipIndex = 0; mipIndex <= 1; mipIndex++)
+        const int maxMipIndex = mipFrac > 0.f ? 1 : 0;
+        for (int mipIndex = 0; mipIndex <= maxMipIndex; mipIndex++)
         {
             int mip = min(mipBase + mipIndex, maxMip);
             const BC6Parameters *texture = feature.grid[mip];
@@ -291,7 +307,8 @@ NT_DEVICE inline void BackwardFeaturePass(KernelParams &params,
     {
         Feature &feature = params.features[featureIndex];
         const int maxMip = feature.numMips > 0 ? feature.numMips - 1 : 0;
-        for (int mipIndex = 0; mipIndex <= 1; mipIndex++)
+        const int maxMipIndex = mipFrac > 0.f ? 1 : 0;
+        for (int mipIndex = 0; mipIndex <= maxMipIndex; mipIndex++)
         {
             int mip = min(mipBase + mipIndex, maxMip);
             int width = max(feature.width >> mip, 1);
@@ -376,7 +393,8 @@ NT_DEVICE inline void BackwardUnconstrainedFeaturePass(
     {
         Feature &feature = params.features[featureIndex];
         const int maxMip = feature.numMips > 0 ? feature.numMips - 1 : 0;
-        for (int mipIndex = 0; mipIndex <= 1; mipIndex++)
+        const int maxMipIndex = mipFrac > 0.f ? 1 : 0;
+        for (int mipIndex = 0; mipIndex <= maxMipIndex; mipIndex++)
         {
             int mip = min(mipBase + mipIndex, maxMip);
             int width = max(feature.width >> mip, 1);
@@ -622,15 +640,26 @@ NT_DEVICE inline void OptimizeFeaturePass(KernelParams params)
 template <uint32_t numThreads, TrainingKernelType type>
 NT_DEVICE void TrainLoopPass(KernelParams params)
 {
-    const uint32_t threadID = threadIdx.y * blockDim.x + threadIdx.x;
-    (void)threadID;
-    RNG rng;
+    const uint32_t sampleIndex = blockIdx.x * blockDim.x + threadIdx.x;
+    if (sampleIndex >= (uint32_t)params.numSamples)
+    {
+        return;
+    }
+
+    constexpr int kTrainingRegionSize = 512;
+    const uint32_t sampleX = sampleIndex % kTrainingRegionSize;
+    const uint32_t sampleY = sampleIndex / kTrainingRegionSize;
+
+    RNG rng(sampleIndex ^ ((uint32_t)params.step * 747796405u + 2891336453u));
 
     {
-        float u = rng.UniformFloat();
-        float v = rng.UniformFloat();
-        float s = rng.UniformFloat();
-        float3 uvs = make_float3(u, v, s);
+        float jitterX = rng.UniformFloat() - 0.5f;
+        float jitterY = rng.UniformFloat() - 0.5f;
+        float samplePosX = Clamp((float)sampleX + 0.5f + jitterX, 0.5f, (float)params.imageWidth - 0.5f);
+        float samplePosY = Clamp((float)sampleY + 0.5f + jitterY, 0.5f, (float)params.imageHeight - 0.5f);
+        float u = samplePosX / (float)params.imageWidth;
+        float v = samplePosY / (float)params.imageHeight;
+        float3 uvs = make_float3(u, v, 0.f);
 
         half sampledFeatures[NT_NUM_FEATURES * 3];
         SampleFourFeaturesTrilinear(params, uvs, sampledFeatures);

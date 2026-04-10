@@ -2,6 +2,7 @@
 #include <array>
 #include <cassert>
 #include <cctype>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
@@ -812,6 +813,23 @@ int main(int argc, char *argv[])
             uploadedTextures.empty() ? params.imageWidth : uploadedTextures[0].width;
         params.imageHeight =
             uploadedTextures.empty() ? params.imageHeight : uploadedTextures[0].height;
+        if (!uploadedTextures.empty())
+        {
+            if (params.imageWidth < 512 || params.imageHeight < 512)
+            {
+                throw std::runtime_error(
+                    "Smoke-test training expects reference textures of at least 512x512");
+            }
+
+            for (const UploadedTexture &texture : uploadedTextures)
+            {
+                if (texture.width != params.imageWidth || texture.height != params.imageHeight)
+                {
+                    throw std::runtime_error("All reference textures must have the same "
+                                             "dimensions for smoke-test training");
+                }
+            }
+        }
 
         const TrainingModeConfig &modeConfig = gTrainingModeConfigs[options.mode];
         std::printf("Mode %d (%s)\n", options.mode, modeConfig.name);
@@ -835,6 +853,57 @@ int main(int argc, char *argv[])
                 (unsigned long long)texture.texture);
         }
 
+#if 1
+        const int unconstrainedThreshold = 5000;
+        const int blockFeaturesThreshold = unconstrainedThreshold + 200000;
+        const int maxIters = blockFeaturesThreshold + 1000;
+        const int progressInterval = 1000;
+        const auto trainingStart = std::chrono::steady_clock::now();
+
+        std::printf("Starting training for %d iterations\n", maxIters);
+
+        for (int iter = 0; iter < maxIters; iter++)
+        {
+            // if (iter == unconstrainedThreshold)
+            // {
+            // }
+
+            TrainingKernelType type;
+            if (iter < unconstrainedThreshold)
+            {
+                type = TrainingKernelType::UNCONSTRAINED;
+            }
+            else if (iter < blockFeaturesThreshold)
+            {
+                type = TrainingKernelType::BLOCK_FEATURES;
+            }
+            else
+            {
+                type = TrainingKernelType::FINALIZE;
+            }
+
+            type = TrainingKernelType::UNCONSTRAINED;
+
+            InvokeTraining(params, type);
+            InvokeOptimizeNetwork(params);
+            if (type != TrainingKernelType::FINALIZE)
+            {
+                InvokeOptimizeFeatures(params);
+            }
+            params.step++;
+
+            if (((iter + 1) % progressInterval) == 0 || (iter + 1) == maxIters)
+            {
+                CheckCuda(cudaDeviceSynchronize(), "cudaDeviceSynchronize(training progress)");
+                const auto now = std::chrono::steady_clock::now();
+                const double elapsedSeconds =
+                    std::chrono::duration<double>(now - trainingStart).count();
+                std::printf(
+                    "Completed iteration %d / %d (%.2fs)\n", iter + 1, maxIters, elapsedSeconds);
+            }
+        }
+#endif
+
         DestroyUploadedTextures(uploadedTextures);
         return 0;
     }
@@ -844,43 +913,5 @@ int main(int argc, char *argv[])
         std::fprintf(stderr, "%s\n", error.what());
         return 1;
     }
-
-    // 1. what rng am i using?
-    // 2. how do I initialize the features?
-    // 4. set feature sizes
-#if 1
-    const int unconstrainedThreshold = 5000;
-    const int blockFeaturesThreshold = unconstrainedThreshold + 200000;
-    const int maxIters = blockFeaturesThreshold + 1000;
-
-    for (int iter = 0; iter < maxIters; iter++)
-    {
-        // if (iter == unconstrainedThreshold)
-        // {
-        // }
-
-        TrainingKernelType type;
-        if (iter < unconstrainedThreshold)
-        {
-            type = TrainingKernelType::UNCONSTRAINED;
-        }
-        else if (iter < blockFeaturesThreshold)
-        {
-            type = TrainingKernelType::BLOCK_FEATURES;
-        }
-        else
-        {
-            type = TrainingKernelType::FINALIZE;
-        }
-
-        InvokeTraining(params, type);
-        InvokeOptimizeNetwork(params);
-        if (type != TrainingKernelType::FINALIZE)
-        {
-            InvokeOptimizeFeatures(params);
-        }
-        params.step++;
-    }
-#endif
 #endif
 }
