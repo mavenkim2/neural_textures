@@ -45,8 +45,9 @@ struct HostTexture
     int height = 0;
     int numChannels = 0;
     int cudaChannels = 0;
+    int numMipLevels = 0;
     std::vector<std::string> channelNames;
-    std::vector<float> pixels;
+    std::vector<std::vector<float>> mipPixels;
 };
 
 struct UploadedTexture
@@ -56,7 +57,8 @@ struct UploadedTexture
     int height = 0;
     int numChannels = 0;
     int cudaChannels = 0;
-    cudaArray_t array = nullptr;
+    int numMipLevels = 0;
+    cudaMipmappedArray_t mipmappedArray = nullptr;
     cudaTextureObject_t texture = 0;
 };
 
@@ -77,6 +79,136 @@ int GetCudaChannelCount(int numChannels)
     }
 
     return numChannels;
+}
+
+int GetMipDimension(int baseDimension, int level, bool roundUp)
+{
+    if (roundUp)
+    {
+        const int divisor = 1 << level;
+        return std::max(1, (baseDimension + divisor - 1) / divisor);
+    }
+
+    return std::max(1, baseDimension >> level);
+}
+
+bool ChannelLoadsAsUint(const EXRHeader &header, int channelIndex)
+{
+    return header.requested_pixel_types[channelIndex] == TINYEXR_PIXELTYPE_UINT;
+}
+
+void CopyExrPixelToMip(const EXRHeader &header,
+                       unsigned char **images,
+                       int numChannels,
+                       int cudaChannels,
+                       int sourceIndex,
+                       float *destPixel)
+{
+    if (numChannels == 1)
+    {
+        if (ChannelLoadsAsUint(header, 0))
+        {
+            destPixel[0] = (float)reinterpret_cast<unsigned int **>(images)[0][sourceIndex];
+        }
+        else
+        {
+            destPixel[0] = reinterpret_cast<float **>(images)[0][sourceIndex];
+        }
+        return;
+    }
+
+    for (int channelIndex = 0; channelIndex < numChannels; ++channelIndex)
+    {
+        if (ChannelLoadsAsUint(header, channelIndex))
+        {
+            destPixel[channelIndex] =
+                (float)reinterpret_cast<unsigned int **>(images)[channelIndex][sourceIndex];
+        }
+        else
+        {
+            destPixel[channelIndex] = reinterpret_cast<float **>(images)[channelIndex][sourceIndex];
+        }
+    }
+
+    if (numChannels == 3 && cudaChannels == 4)
+    {
+        destPixel[3] = 1.f;
+    }
+}
+
+std::vector<std::vector<float>>
+LoadExrMipChainFromTiles(const std::filesystem::path &path, const EXRHeader &exrHeader)
+{
+    EXRImage exrImage;
+    InitEXRImage(&exrImage);
+
+    const char *errorMessage = nullptr;
+    const int result = LoadEXRImageFromFile(&exrImage, &exrHeader, path.string().c_str(), &errorMessage);
+    if (result != TINYEXR_SUCCESS)
+    {
+        std::string message = "Failed to load tiled EXR image";
+        if (errorMessage)
+        {
+            message += ": ";
+            message += errorMessage;
+            FreeEXRErrorMessage(errorMessage);
+        }
+        throw std::runtime_error(message);
+    }
+
+    int maxLevel = 0;
+    for (int tileIndex = 0; tileIndex < exrImage.num_tiles; ++tileIndex)
+    {
+        const EXRTile &tile = exrImage.tiles[tileIndex];
+        if (tile.level_x != tile.level_y)
+        {
+            FreeEXRImage(&exrImage);
+            throw std::runtime_error("Ripmap EXRs are not supported: " + path.string());
+        }
+
+        maxLevel = std::max(maxLevel, tile.level_x);
+    }
+
+    const int cudaChannels = GetCudaChannelCount(exrHeader.num_channels);
+    const bool roundUp = exrHeader.tile_rounding_mode == TINYEXR_TILE_ROUND_UP;
+    std::vector<std::vector<float>> mipPixels((size_t)maxLevel + 1);
+
+    for (int mipLevel = 0; mipLevel <= maxLevel; ++mipLevel)
+    {
+        const int mipWidth = GetMipDimension(exrImage.width, mipLevel, roundUp);
+        const int mipHeight = GetMipDimension(exrImage.height, mipLevel, roundUp);
+        mipPixels[(size_t)mipLevel].resize((size_t)mipWidth * (size_t)mipHeight * (size_t)cudaChannels,
+                                           0.f);
+    }
+
+    for (int tileIndex = 0; tileIndex < exrImage.num_tiles; ++tileIndex)
+    {
+        const EXRTile &tile = exrImage.tiles[tileIndex];
+        const int mipLevel = tile.level_x;
+        const int mipWidth = GetMipDimension(exrImage.width, mipLevel, roundUp);
+        float *mipData = mipPixels[(size_t)mipLevel].data();
+
+        for (int tileY = 0; tileY < tile.height; ++tileY)
+        {
+            for (int tileX = 0; tileX < tile.width; ++tileX)
+            {
+                const int destX = tile.offset_x * exrHeader.tile_size_x + tileX;
+                const int destY = tile.offset_y * exrHeader.tile_size_y + tileY;
+                const int sourceIndex = tileY * tile.width + tileX;
+                float *destPixel = &mipData[((size_t)destY * (size_t)mipWidth + (size_t)destX) *
+                                            (size_t)cudaChannels];
+                CopyExrPixelToMip(exrHeader,
+                                  tile.images,
+                                  exrHeader.num_channels,
+                                  cudaChannels,
+                                  sourceIndex,
+                                  destPixel);
+            }
+        }
+    }
+
+    FreeEXRImage(&exrImage);
+    return mipPixels;
 }
 
 HostTexture LoadExrTexture(const std::filesystem::path &path)
@@ -153,8 +285,6 @@ HostTexture LoadExrTexture(const std::filesystem::path &path)
     texture.height = height;
     texture.numChannels = exrHeader.num_channels;
     texture.cudaChannels = GetCudaChannelCount(texture.numChannels);
-    texture.pixels.resize((size_t)texture.width * (size_t)texture.height *
-                          (size_t)texture.cudaChannels);
     texture.channelNames.reserve((size_t)texture.numChannels);
 
     for (int channelIndex = 0; channelIndex < texture.numChannels; ++channelIndex)
@@ -162,24 +292,38 @@ HostTexture LoadExrTexture(const std::filesystem::path &path)
         texture.channelNames.emplace_back(exrHeader.channels[channelIndex].name);
     }
 
-    const size_t pixelCount = (size_t)texture.width * (size_t)texture.height;
-    for (size_t pixelIndex = 0; pixelIndex < pixelCount; ++pixelIndex)
+    if (exrHeader.tiled && exrHeader.tile_level_mode == TINYEXR_TILE_MIPMAP_LEVELS)
     {
-        if (texture.numChannels == 1)
-        {
-            texture.pixels[pixelIndex] = rgbaData[4 * pixelIndex + 0];
-        }
-        else
-        {
-            for (int channelIndex = 0; channelIndex < texture.numChannels; ++channelIndex)
-            {
-                texture.pixels[pixelIndex * (size_t)texture.cudaChannels + (size_t)channelIndex] =
-                    rgbaData[4 * pixelIndex + (size_t)channelIndex];
-            }
+        texture.mipPixels = LoadExrMipChainFromTiles(path, exrHeader);
+        texture.numMipLevels = (int)texture.mipPixels.size();
+    }
+    else
+    {
+        texture.numMipLevels = 1;
+        texture.mipPixels.resize(1);
+        texture.mipPixels[0].resize((size_t)texture.width * (size_t)texture.height *
+                                    (size_t)texture.cudaChannels);
 
-            if (texture.numChannels == 3)
+        const size_t pixelCount = (size_t)texture.width * (size_t)texture.height;
+        for (size_t pixelIndex = 0; pixelIndex < pixelCount; ++pixelIndex)
+        {
+            if (texture.numChannels == 1)
             {
-                texture.pixels[pixelIndex * (size_t)texture.cudaChannels + 3] = 1.f;
+                texture.mipPixels[0][pixelIndex] = rgbaData[4 * pixelIndex + 0];
+            }
+            else
+            {
+                for (int channelIndex = 0; channelIndex < texture.numChannels; ++channelIndex)
+                {
+                    texture.mipPixels[0][pixelIndex * (size_t)texture.cudaChannels +
+                                         (size_t)channelIndex] =
+                        rgbaData[4 * pixelIndex + (size_t)channelIndex];
+                }
+
+                if (texture.numChannels == 3)
+                {
+                    texture.mipPixels[0][pixelIndex * (size_t)texture.cudaChannels + 3] = 1.f;
+                }
             }
         }
     }
@@ -208,36 +352,53 @@ UploadedTexture UploadTexture(const HostTexture &hostTexture)
     uploadedTexture.height = hostTexture.height;
     uploadedTexture.numChannels = hostTexture.numChannels;
     uploadedTexture.cudaChannels = hostTexture.cudaChannels;
+    uploadedTexture.numMipLevels = hostTexture.numMipLevels;
 
     cudaChannelFormatDesc channelDesc = CreateChannelDesc(hostTexture.cudaChannels);
-    CheckCuda(cudaMallocArray(&uploadedTexture.array,
-                              &channelDesc,
-                              (size_t)hostTexture.width,
-                              (size_t)hostTexture.height),
-              "cudaMallocArray");
+    CheckCuda(cudaMallocMipmappedArray(&uploadedTexture.mipmappedArray,
+                                       &channelDesc,
+                                       make_cudaExtent((size_t)hostTexture.width,
+                                                       (size_t)hostTexture.height,
+                                                       0),
+                                       (unsigned int)hostTexture.numMipLevels),
+              "cudaMallocMipmappedArray");
 
-    const size_t rowPitch =
-        (size_t)hostTexture.width * (size_t)hostTexture.cudaChannels * sizeof(float);
-    CheckCuda(cudaMemcpy2DToArray(uploadedTexture.array,
-                                  0,
-                                  0,
-                                  hostTexture.pixels.data(),
-                                  rowPitch,
-                                  rowPitch,
-                                  (size_t)hostTexture.height,
-                                  cudaMemcpyHostToDevice),
-              "cudaMemcpy2DToArray");
+    for (int mipLevel = 0; mipLevel < hostTexture.numMipLevels; ++mipLevel)
+    {
+        cudaArray_t levelArray = nullptr;
+        CheckCuda(cudaGetMipmappedArrayLevel(&levelArray,
+                                             uploadedTexture.mipmappedArray,
+                                             (unsigned int)mipLevel),
+                  "cudaGetMipmappedArrayLevel");
+
+        const int mipWidth = GetMipDimension(hostTexture.width, mipLevel, false);
+        const int mipHeight = GetMipDimension(hostTexture.height, mipLevel, false);
+        const size_t rowPitch =
+            (size_t)mipWidth * (size_t)hostTexture.cudaChannels * sizeof(float);
+        CheckCuda(cudaMemcpy2DToArray(levelArray,
+                                      0,
+                                      0,
+                                      hostTexture.mipPixels[(size_t)mipLevel].data(),
+                                      rowPitch,
+                                      rowPitch,
+                                      (size_t)mipHeight,
+                                      cudaMemcpyHostToDevice),
+                  "cudaMemcpy2DToArray");
+    }
 
     cudaResourceDesc resourceDesc = {};
-    resourceDesc.resType = cudaResourceTypeArray;
-    resourceDesc.res.array.array = uploadedTexture.array;
+    resourceDesc.resType = cudaResourceTypeMipmappedArray;
+    resourceDesc.res.mipmap.mipmap = uploadedTexture.mipmappedArray;
 
     cudaTextureDesc textureDesc = {};
     textureDesc.addressMode[0] = cudaAddressModeWrap;
     textureDesc.addressMode[1] = cudaAddressModeWrap;
     textureDesc.filterMode = cudaFilterModeLinear;
+    textureDesc.mipmapFilterMode = cudaFilterModeLinear;
     textureDesc.readMode = cudaReadModeElementType;
     textureDesc.normalizedCoords = 1;
+    textureDesc.minMipmapLevelClamp = 0.0f;
+    textureDesc.maxMipmapLevelClamp = (float)(hostTexture.numMipLevels - 1);
 
     try
     {
@@ -247,8 +408,8 @@ UploadedTexture UploadTexture(const HostTexture &hostTexture)
     }
     catch (...)
     {
-        cudaFreeArray(uploadedTexture.array);
-        uploadedTexture.array = nullptr;
+        cudaFreeMipmappedArray(uploadedTexture.mipmappedArray);
+        uploadedTexture.mipmappedArray = nullptr;
         throw;
     }
 
@@ -265,10 +426,10 @@ void DestroyUploadedTextures(std::vector<UploadedTexture> &textures)
             texture.texture = 0;
         }
 
-        if (texture.array != nullptr)
+        if (texture.mipmappedArray != nullptr)
         {
-            cudaFreeArray(texture.array);
-            texture.array = nullptr;
+            cudaFreeMipmappedArray(texture.mipmappedArray);
+            texture.mipmappedArray = nullptr;
         }
     }
 }
@@ -323,13 +484,14 @@ int main(int argc, char *argv[])
 
         for (const UploadedTexture &texture : uploadedTextures)
         {
-            std::printf("Loaded %s (%dx%d, %d channel%s, cuda=%d) -> cudaTextureObject_t=%llu\n",
+            std::printf("Loaded %s (%dx%d, %d channel%s, cuda=%d, mips=%d) -> cudaTextureObject_t=%llu\n",
                         texture.path.string().c_str(),
                         texture.width,
                         texture.height,
                         texture.numChannels,
                         texture.numChannels == 1 ? "" : "s",
                         texture.cudaChannels,
+                        texture.numMipLevels,
                         (unsigned long long)texture.texture);
         }
 
@@ -343,6 +505,7 @@ int main(int argc, char *argv[])
         return 1;
     }
 
+#if 0
     const int unconstrainedThreshold = 5000;
     const int blockFeaturesThreshold = unconstrainedThreshold + 200000;
     const int maxIters = blockFeaturesThreshold + 1000;
@@ -370,5 +533,6 @@ int main(int argc, char *argv[])
         InvokeOptimizeFeatures(params);
         params.step++;
     }
+#endif
 #endif
 }
