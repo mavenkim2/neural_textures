@@ -434,6 +434,30 @@ void DestroyUploadedTextures(std::vector<UploadedTexture> &textures)
     }
 }
 
+void InitializeReferenceTextures(neural_textures::KernelParams &params,
+                                 const std::vector<UploadedTexture> &uploadedTextures)
+{
+    if (uploadedTextures.size() > NT_MAX_REFERENCE_TEXTURES)
+    {
+        throw std::runtime_error("Too many reference textures for KernelParams: " +
+                                 std::to_string(uploadedTextures.size()));
+    }
+
+    params.numReferenceTextures = (int)uploadedTextures.size();
+
+    for (int textureIndex = 0; textureIndex < params.numReferenceTextures; ++textureIndex)
+    {
+        const UploadedTexture &uploadedTexture = uploadedTextures[(size_t)textureIndex];
+        neural_textures::ReferenceTexture &referenceTexture =
+            params.referenceTextures[textureIndex];
+        referenceTexture.texture = uploadedTexture.texture;
+        referenceTexture.width = uploadedTexture.width;
+        referenceTexture.height = uploadedTexture.height;
+        referenceTexture.numChannels = uploadedTexture.numChannels;
+        referenceTexture.numMipLevels = uploadedTexture.numMipLevels;
+    }
+}
+
 #endif
 
 } // namespace
@@ -454,6 +478,17 @@ int main(int argc, char *argv[])
 #else
     std::vector<HostTexture> hostTextures;
     hostTextures.reserve((size_t)argc - 1);
+
+    KernelParams params = {};
+    params.featureAdam.learningRate = .05f;
+    params.featureAdam.beta1 = 0.9f;
+    params.featureAdam.beta2 = 0.999f;
+    params.featureAdam.epsilon = 1e-8f;
+
+    params.networkAdam.learningRate = .001f;
+    params.networkAdam.beta1 = 0.9f;
+    params.networkAdam.beta2 = 0.999f;
+    params.networkAdam.epsilon = 1e-8f;
 
     try
     {
@@ -482,6 +517,8 @@ int main(int argc, char *argv[])
             uploadedTextures.push_back(UploadTexture(hostTexture));
         }
 
+        InitializeReferenceTextures(params, uploadedTextures);
+
         for (const UploadedTexture &texture : uploadedTextures)
         {
             std::printf(
@@ -508,17 +545,18 @@ int main(int argc, char *argv[])
 
     // 1. what rng am i using?
     // 2. how do I initialize the features?
-    // 3. actually sampling the reference textures during training
     // 4. set feature sizes
 #if 1
     const int unconstrainedThreshold = 5000;
     const int blockFeaturesThreshold = unconstrainedThreshold + 200000;
     const int maxIters = blockFeaturesThreshold + 1000;
 
-    KernelParams params;
-
     for (int iter = 0; iter < maxIters; iter++)
     {
+        // if (iter == unconstrainedThreshold)
+        // {
+        // }
+
         TrainingKernelType type;
         if (iter < unconstrainedThreshold)
         {

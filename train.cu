@@ -64,6 +64,7 @@ template <typename T>
 NT_DEVICE inline T SampleReferenceTextureTrilinear(const ReferenceTexture &texture,
                                                    const float3 &uvs)
 {
+    // TODO: will the 1x1 final mip be correctly handled by this?
     const int maxMip = texture.numMipLevels > 0 ? texture.numMipLevels - 1 : 0;
     const float mipCoord = Clamp(uvs.z, 0.f, (float)maxMip);
     const int mip0 = min((int)floorf(mipCoord), maxMip);
