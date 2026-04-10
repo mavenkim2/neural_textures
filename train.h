@@ -61,6 +61,7 @@ struct Feature
 
     int width; // in texels
     int height;
+    int numMips;
 };
 
 struct ReferenceTexture

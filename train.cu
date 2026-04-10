@@ -239,9 +239,10 @@ SampleFourFeaturesTrilinear(const KernelParams &params, float3 uvs, half *outFea
     for (int featureIndex = 0; featureIndex < NT_NUM_FEATURES; ++featureIndex)
     {
         const Feature &feature = params.features[featureIndex];
+        const int maxMip = feature.numMips > 0 ? feature.numMips - 1 : 0;
         for (int mipIndex = 0; mipIndex <= 1; mipIndex++)
         {
-            int mip = mipBase + mipIndex;
+            int mip = min(mipBase + mipIndex, maxMip);
             const BC6Parameters *texture = feature.grid[mip];
 
             int width = max(feature.width >> mip, 1);
@@ -289,9 +290,10 @@ NT_DEVICE inline void BackwardFeaturePass(KernelParams &params,
     for (int featureIndex = 0; featureIndex < NT_NUM_FEATURES; ++featureIndex)
     {
         Feature &feature = params.features[featureIndex];
+        const int maxMip = feature.numMips > 0 ? feature.numMips - 1 : 0;
         for (int mipIndex = 0; mipIndex <= 1; mipIndex++)
         {
-            int mip = mipBase + mipIndex;
+            int mip = min(mipBase + mipIndex, maxMip);
             int width = max(feature.width >> mip, 1);
             int height = max(feature.height >> mip, 1);
             int numBlocksU = max(1, width >> 2);
@@ -373,9 +375,10 @@ NT_DEVICE inline void BackwardUnconstrainedFeaturePass(
     for (int featureIndex = 0; featureIndex < NT_NUM_FEATURES; ++featureIndex)
     {
         Feature &feature = params.features[featureIndex];
+        const int maxMip = feature.numMips > 0 ? feature.numMips - 1 : 0;
         for (int mipIndex = 0; mipIndex <= 1; mipIndex++)
         {
-            int mip = mipBase + mipIndex;
+            int mip = min(mipBase + mipIndex, maxMip);
             int width = max(feature.width >> mip, 1);
             int height = max(feature.height >> mip, 1);
             int numBlocksU = max(1, width >> 2);
@@ -589,7 +592,7 @@ NT_DEVICE inline void OptimizeFeaturePass(KernelParams params)
     for (int featureIndex = 0; featureIndex < NT_NUM_FEATURES; ++featureIndex)
     {
         Feature &feature = params.features[featureIndex];
-        for (int mip = 0; mip < params.numMips; ++mip)
+        for (int mip = 0; mip < feature.numMips; ++mip)
         {
             const int numBlocks = GetNumBlocksAtMip(feature, mip);
             const int segmentEnd = baseBlockIndex + numBlocks;
@@ -709,7 +712,7 @@ void InvokeOptimizeFeatures(KernelParams params)
     for (int featureIndex = 0; featureIndex < NT_NUM_FEATURES; ++featureIndex)
     {
         const Feature &feature = params.features[featureIndex];
-        for (int mip = 0; mip < params.numMips; ++mip)
+        for (int mip = 0; mip < feature.numMips; ++mip)
         {
             totalBlocks += GetNumBlocksAtMip(feature, mip);
         }
@@ -728,7 +731,7 @@ void InvokeOptimizeFeatures(KernelParams params)
 void InvokeTraining(KernelParams params, TrainingKernelType type)
 {
     const int kThreadsPerBlock = 256;
-    const int numSamples = 512 * 512;
+    const int numSamples = params.numSamples > 0 ? params.numSamples : 512 * 512;
     const int numBlocks = (numSamples + kThreadsPerBlock - 1) / kThreadsPerBlock;
     if (type == TrainingKernelType::UNCONSTRAINED)
     {

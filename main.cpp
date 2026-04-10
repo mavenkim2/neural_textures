@@ -1,9 +1,11 @@
 #include <algorithm>
+#include <array>
 #include <cassert>
 #include <cctype>
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
+#include <random>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -33,10 +35,41 @@ std::string ToLower(std::string value)
 
 void PrintUsage(const char *programName)
 {
-    std::printf("Usage: %s <texture0.exr> [texture1.exr ...]\n", programName);
+    std::printf("Usage: %s [--mode <0-3>] <texture0.exr> [texture1.exr ...]\n", programName);
+    std::printf("  mode 0 = BCf-0.5k\n");
+    std::printf("  mode 1 = BCf-1k\n");
+    std::printf("  mode 2 = BCf-2k (default)\n");
+    std::printf("  mode 3 = BCf-2k++\n");
 }
 
 #if NT_HAS_CUDA
+
+using namespace neural_textures;
+
+struct CommandLineOptions
+{
+    int mode = 2;
+    std::vector<std::filesystem::path> inputPaths;
+};
+
+struct FeatureModeConfig
+{
+    int resolution = 0;
+    int numMips = 0;
+};
+
+struct TrainingModeConfig
+{
+    const char *name = "";
+    std::array<FeatureModeConfig, NT_NUM_FEATURES> features;
+};
+
+constexpr TrainingModeConfig gTrainingModeConfigs[] = {
+    {"BCf-0.5k", {{{512, 8}, {256, 7}, {128, 6}, {64, 5}}}},
+    {"BCf-1k", {{{1024, 9}, {512, 8}, {256, 7}, {128, 6}}}},
+    {"BCf-2k", {{{2048, 10}, {1024, 9}, {512, 8}, {256, 7}}}},
+    {"BCf-2k++", {{{2048, 10}, {2048, 10}, {512, 8}, {256, 7}}}},
+};
 
 struct HostTexture
 {
@@ -71,6 +104,102 @@ void CheckCuda(cudaError_t result, const char *operation)
     }
 }
 
+CommandLineOptions ParseCommandLine(int argc, char *argv[])
+{
+    CommandLineOptions options;
+
+    for (int argIndex = 1; argIndex < argc; ++argIndex)
+    {
+        const std::string argument = argv[argIndex];
+        if (argument == "--mode" || argument == "-m")
+        {
+            if (argIndex + 1 >= argc)
+            {
+                throw std::runtime_error("Expected an integer after --mode");
+            }
+
+            options.mode = std::stoi(argv[++argIndex]);
+            continue;
+        }
+
+        if (argument.rfind("--mode=", 0) == 0)
+        {
+            options.mode = std::stoi(argument.substr(7));
+            continue;
+        }
+
+        options.inputPaths.emplace_back(argv[argIndex]);
+    }
+
+    if (options.mode < 0 || options.mode >= (int)std::size(gTrainingModeConfigs))
+    {
+        throw std::runtime_error("Mode must be in the range [0, 3]");
+    }
+
+    return options;
+}
+
+template <typename T>
+T *AllocateDeviceBuffer(size_t count, const char *operation)
+{
+    T *buffer = nullptr;
+    CheckCuda(cudaMalloc((void **)&buffer, count * sizeof(T)), operation);
+    return buffer;
+}
+
+template <typename T>
+void ZeroDeviceBuffer(T *buffer, size_t count, const char *operation)
+{
+    CheckCuda(cudaMemset(buffer, 0, count * sizeof(T)), operation);
+}
+
+template <typename T>
+T **UploadPointerArray(const std::vector<T *> &hostPointers, const char *operation)
+{
+    T **devicePointers = AllocateDeviceBuffer<T *>(hostPointers.size(), operation);
+    CheckCuda(cudaMemcpy(devicePointers,
+                         hostPointers.data(),
+                         hostPointers.size() * sizeof(T *),
+                         cudaMemcpyHostToDevice),
+              operation);
+    return devicePointers;
+}
+
+template <typename T>
+void UploadHostVector(T *deviceBuffer, const std::vector<T> &hostData, const char *operation)
+{
+    CheckCuda(
+        cudaMemcpy(
+            deviceBuffer, hostData.data(), hostData.size() * sizeof(T), cudaMemcpyHostToDevice),
+        operation);
+}
+
+std::vector<half>
+InitializeNetworkWeights(size_t totalCount, size_t activeCount, std::mt19937 &rng, float scale)
+{
+    std::uniform_real_distribution<float> distribution(-scale, scale);
+    std::vector<half> weights(totalCount, __float2half(0.f));
+    for (size_t index = 0; index < activeCount; ++index)
+    {
+        weights[index] = __float2half(distribution(rng));
+    }
+
+    return weights;
+}
+
+std::vector<float3> InitializeFloat3Texels(size_t texelCount, std::mt19937 &rng)
+{
+    std::uniform_real_distribution<float> distribution(0.f, 1.f);
+    std::vector<float3> texels(texelCount);
+
+    for (float3 &texel : texels)
+    {
+        texel = make_float3(distribution(rng), distribution(rng), distribution(rng));
+    }
+
+    return texels;
+}
+
 int GetCudaChannelCount(int numChannels)
 {
     if (numChannels == 3)
@@ -90,6 +219,12 @@ int GetMipDimension(int baseDimension, int level, bool roundUp)
     }
 
     return std::max(1, baseDimension >> level);
+}
+
+int GetBlockCountForDimension(int size)
+{
+    int numBlocks = size >> 2;
+    return numBlocks > 0 ? numBlocks : 1;
 }
 
 bool ChannelLoadsAsUint(const EXRHeader &header, int channelIndex)
@@ -434,6 +569,168 @@ void DestroyUploadedTextures(std::vector<UploadedTexture> &textures)
     }
 }
 
+void InitializeFeatureStorage(Feature &feature, const FeatureModeConfig &config, std::mt19937 &rng)
+{
+    feature.width = config.resolution;
+    feature.height = config.resolution;
+    feature.numMips = config.numMips;
+
+    std::vector<BC6Parameters *> gridPointers((size_t)feature.numMips);
+    std::vector<BC6ParameterGradients *> gradientPointers((size_t)feature.numMips);
+    std::vector<BC6ParameterGradients *> moment1Pointers((size_t)feature.numMips);
+    std::vector<BC6ParameterGradients *> moment2Pointers((size_t)feature.numMips);
+    std::vector<float3 *> unconstrainedGridPointers((size_t)feature.numMips);
+    std::vector<float3 *> unconstrainedGradientPointers((size_t)feature.numMips);
+    std::vector<float3 *> unconstrainedMoment1Pointers((size_t)feature.numMips);
+    std::vector<float3 *> unconstrainedMoment2Pointers((size_t)feature.numMips);
+
+    for (int mip = 0; mip < feature.numMips; ++mip)
+    {
+        const int mipWidth = std::max(feature.width >> mip, 1);
+        const int mipHeight = std::max(feature.height >> mip, 1);
+        const size_t texelCount = (size_t)mipWidth * (size_t)mipHeight;
+        const size_t blockCount = (size_t)GetBlockCountForDimension(mipWidth) *
+                                  (size_t)GetBlockCountForDimension(mipHeight);
+
+        gridPointers[(size_t)mip] =
+            AllocateDeviceBuffer<BC6Parameters>(blockCount, "cudaMalloc(feature.grid[mip])");
+        gradientPointers[(size_t)mip] = AllocateDeviceBuffer<BC6ParameterGradients>(
+            blockCount, "cudaMalloc(feature.gradients[mip])");
+        moment1Pointers[(size_t)mip] = AllocateDeviceBuffer<BC6ParameterGradients>(
+            blockCount, "cudaMalloc(feature.moment1[mip])");
+        moment2Pointers[(size_t)mip] = AllocateDeviceBuffer<BC6ParameterGradients>(
+            blockCount, "cudaMalloc(feature.moment2[mip])");
+
+        ZeroDeviceBuffer(gridPointers[(size_t)mip], blockCount, "cudaMemset(feature.grid[mip])");
+        ZeroDeviceBuffer(
+            gradientPointers[(size_t)mip], blockCount, "cudaMemset(feature.gradients[mip])");
+        ZeroDeviceBuffer(
+            moment1Pointers[(size_t)mip], blockCount, "cudaMemset(feature.moment1[mip])");
+        ZeroDeviceBuffer(
+            moment2Pointers[(size_t)mip], blockCount, "cudaMemset(feature.moment2[mip])");
+
+        unconstrainedGridPointers[(size_t)mip] =
+            AllocateDeviceBuffer<float3>(texelCount, "cudaMalloc(feature.unconstrainedGrid[mip])");
+        unconstrainedGradientPointers[(size_t)mip] = AllocateDeviceBuffer<float3>(
+            texelCount, "cudaMalloc(feature.unconstrainedGradients[mip])");
+        unconstrainedMoment1Pointers[(size_t)mip] = AllocateDeviceBuffer<float3>(
+            texelCount, "cudaMalloc(feature.unconstrainedMoment1[mip])");
+        unconstrainedMoment2Pointers[(size_t)mip] = AllocateDeviceBuffer<float3>(
+            texelCount, "cudaMalloc(feature.unconstrainedMoment2[mip])");
+
+        std::vector<float3> texels = InitializeFloat3Texels(texelCount, rng);
+        UploadHostVector(unconstrainedGridPointers[(size_t)mip],
+                         texels,
+                         "cudaMemcpy(feature.unconstrainedGrid[mip])");
+        ZeroDeviceBuffer(unconstrainedGradientPointers[(size_t)mip],
+                         texelCount,
+                         "cudaMemset(feature.unconstrainedGradients[mip])");
+        ZeroDeviceBuffer(unconstrainedMoment1Pointers[(size_t)mip],
+                         texelCount,
+                         "cudaMemset(feature.unconstrainedMoment1[mip])");
+        ZeroDeviceBuffer(unconstrainedMoment2Pointers[(size_t)mip],
+                         texelCount,
+                         "cudaMemset(feature.unconstrainedMoment2[mip])");
+    }
+
+    feature.grid = UploadPointerArray(gridPointers, "cudaMemcpy(feature.grid)");
+    feature.gradients = UploadPointerArray(gradientPointers, "cudaMemcpy(feature.gradients)");
+    feature.moment1 = UploadPointerArray(moment1Pointers, "cudaMemcpy(feature.moment1)");
+    feature.moment2 = UploadPointerArray(moment2Pointers, "cudaMemcpy(feature.moment2)");
+    feature.unconstrainedGrid =
+        UploadPointerArray(unconstrainedGridPointers, "cudaMemcpy(feature.unconstrainedGrid)");
+    feature.unconstrainedGradients = UploadPointerArray(
+        unconstrainedGradientPointers, "cudaMemcpy(feature.unconstrainedGradients)");
+    feature.unconstrainedMoment1 = UploadPointerArray(unconstrainedMoment1Pointers,
+                                                      "cudaMemcpy(feature.unconstrainedMoment1)");
+    feature.unconstrainedMoment2 = UploadPointerArray(unconstrainedMoment2Pointers,
+                                                      "cudaMemcpy(feature.unconstrainedMoment2)");
+}
+
+void InitializeNetworkStorage(KernelParams &params, std::mt19937 &rng)
+{
+    constexpr size_t paddedWeightCount = NT_HIDDEN_LAYER_SIZE * NT_HIDDEN_LAYER_SIZE;
+    constexpr size_t biasCount = NT_HIDDEN_LAYER_SIZE;
+    const size_t activeWeightCounts[NT_NUM_NETWORK_LAYERS] = {
+        NT_HIDDEN_LAYER_SIZE * NT_INPUT_SIZE,
+        NT_HIDDEN_LAYER_SIZE * NT_OUTPUT_SIZE,
+    };
+
+    for (int layer = 0; layer < NT_NUM_NETWORK_LAYERS; ++layer)
+    {
+        params.networkWeights[layer] =
+            AllocateDeviceBuffer<half>(paddedWeightCount, "cudaMalloc(networkWeights)");
+        params.networkWeightGradients[layer] =
+            AllocateDeviceBuffer<float>(paddedWeightCount, "cudaMalloc(networkWeightGradients)");
+        params.networkWeightMoment1[layer] =
+            AllocateDeviceBuffer<float>(paddedWeightCount, "cudaMalloc(networkWeightMoment1)");
+        params.networkWeightMoment2[layer] =
+            AllocateDeviceBuffer<float>(paddedWeightCount, "cudaMalloc(networkWeightMoment2)");
+
+        std::vector<half> weights =
+            InitializeNetworkWeights(paddedWeightCount, activeWeightCounts[layer], rng, 1e-2f);
+        UploadHostVector(params.networkWeights[layer], weights, "cudaMemcpy(networkWeights)");
+        ZeroDeviceBuffer(params.networkWeightGradients[layer],
+                         paddedWeightCount,
+                         "cudaMemset(networkWeightGradients)");
+        ZeroDeviceBuffer(params.networkWeightMoment1[layer],
+                         paddedWeightCount,
+                         "cudaMemset(networkWeightMoment1)");
+        ZeroDeviceBuffer(params.networkWeightMoment2[layer],
+                         paddedWeightCount,
+                         "cudaMemset(networkWeightMoment2)");
+
+        params.networkBiases[layer] =
+            AllocateDeviceBuffer<half>(biasCount, "cudaMalloc(networkBiases)");
+        params.networkBiasGradients[layer] =
+            AllocateDeviceBuffer<float>(biasCount, "cudaMalloc(networkBiasGradients)");
+        params.networkBiasMoment1[layer] =
+            AllocateDeviceBuffer<float>(biasCount, "cudaMalloc(networkBiasMoment1)");
+        params.networkBiasMoment2[layer] =
+            AllocateDeviceBuffer<float>(biasCount, "cudaMalloc(networkBiasMoment2)");
+
+        ZeroDeviceBuffer(params.networkBiases[layer], biasCount, "cudaMemset(networkBiases)");
+        ZeroDeviceBuffer(
+            params.networkBiasGradients[layer], biasCount, "cudaMemset(networkBiasGradients)");
+        ZeroDeviceBuffer(
+            params.networkBiasMoment1[layer], biasCount, "cudaMemset(networkBiasMoment1)");
+        ZeroDeviceBuffer(
+            params.networkBiasMoment2[layer], biasCount, "cudaMemset(networkBiasMoment2)");
+    }
+}
+
+void InitializeTrainingMode(KernelParams &params, int mode)
+{
+    const TrainingModeConfig &config = gTrainingModeConfigs[mode];
+    std::mt19937 rng(1337u + (uint32_t)mode);
+
+    params.featureAdam.learningRate = 5e-2f;
+    params.featureAdam.beta1 = 0.9f;
+    params.featureAdam.beta2 = 0.999f;
+    params.featureAdam.epsilon = 1e-8f;
+
+    params.networkAdam.learningRate = 1e-3f;
+    params.networkAdam.beta1 = 0.9f;
+    params.networkAdam.beta2 = 0.999f;
+    params.networkAdam.epsilon = 1e-8f;
+
+    params.numMips = 0;
+    for (int featureIndex = 0; featureIndex < NT_NUM_FEATURES; ++featureIndex)
+    {
+        InitializeFeatureStorage(
+            params.features[featureIndex], config.features[(size_t)featureIndex], rng);
+        params.numMips = std::max(params.numMips, params.features[featureIndex].numMips);
+    }
+
+    InitializeNetworkStorage(params, rng);
+
+    params.imageWidth = config.features[0].resolution;
+    params.imageHeight = config.features[0].resolution;
+    params.numBlocksU = GetBlockCountForDimension(params.imageWidth);
+    params.numBlocksV = GetBlockCountForDimension(params.imageHeight);
+    params.numSamples = 512 * 512;
+}
+
 void InitializeReferenceTextures(neural_textures::KernelParams &params,
                                  const std::vector<UploadedTexture> &uploadedTextures)
 {
@@ -466,35 +763,28 @@ using namespace neural_textures;
 
 int main(int argc, char *argv[])
 {
-    if (argc < 2)
-    {
-        PrintUsage(argv[0]);
-        return 1;
-    }
-
 #if !NT_HAS_CUDA
     std::printf("This build does not have CUDA enabled, so EXR textures cannot be uploaded.\n");
     return 1;
 #else
-    std::vector<HostTexture> hostTextures;
-    hostTextures.reserve((size_t)argc - 1);
-
     KernelParams params = {};
-    params.featureAdam.learningRate = .05f;
-    params.featureAdam.beta1 = 0.9f;
-    params.featureAdam.beta2 = 0.999f;
-    params.featureAdam.epsilon = 1e-8f;
-
-    params.networkAdam.learningRate = .001f;
-    params.networkAdam.beta1 = 0.9f;
-    params.networkAdam.beta2 = 0.999f;
-    params.networkAdam.epsilon = 1e-8f;
 
     try
     {
-        for (int argIndex = 1; argIndex < argc; ++argIndex)
+        CommandLineOptions options = ParseCommandLine(argc, argv);
+        if (options.inputPaths.empty())
         {
-            const std::filesystem::path path = argv[argIndex];
+            PrintUsage(argv[0]);
+            return 1;
+        }
+
+        std::vector<HostTexture> hostTextures;
+        hostTextures.reserve(options.inputPaths.size());
+
+        InitializeTrainingMode(params, options.mode);
+
+        for (const std::filesystem::path &path : options.inputPaths)
+        {
             if (!std::filesystem::exists(path))
             {
                 throw std::runtime_error("Input file does not exist: " + path.string());
@@ -518,6 +808,18 @@ int main(int argc, char *argv[])
         }
 
         InitializeReferenceTextures(params, uploadedTextures);
+        params.imageWidth =
+            uploadedTextures.empty() ? params.imageWidth : uploadedTextures[0].width;
+        params.imageHeight =
+            uploadedTextures.empty() ? params.imageHeight : uploadedTextures[0].height;
+
+        const TrainingModeConfig &modeConfig = gTrainingModeConfigs[options.mode];
+        std::printf("Mode %d (%s)\n", options.mode, modeConfig.name);
+        for (int featureIndex = 0; featureIndex < NT_NUM_FEATURES; ++featureIndex)
+        {
+            const Feature &feature = params.features[featureIndex];
+            std::printf("  T%d: res=%d mips=%d\n", featureIndex, feature.width, feature.numMips);
+        }
 
         for (const UploadedTexture &texture : uploadedTextures)
         {
