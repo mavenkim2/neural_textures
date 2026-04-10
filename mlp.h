@@ -184,19 +184,18 @@ BackwardPass(const tcnn::hvec<NT_OUTPUT_SIZE> &lossGradientVector,
         maxBiasSharedFloats > maxWeightSharedFloats ? maxBiasSharedFloats : maxWeightSharedFloats;
     __shared__ float shmem[shmemFloats > 0 ? shmemFloats : 1];
 
-    tcnn::mma_vec<16> lossGradientMatrix(lossGradientVector); // 32x8
-    // TODO IMPORTANT: NT_OUTPUT_SIZE can change based on the number of outputs
+    tcnn::mma_vec<16> lossGradientMatrix(lossGradientVector); // 32xNT_OUTPUT_SIZE
     SumRows<numThreads, NT_OUTPUT_SIZE>(lossGradientMatrix, shmem, layer1BiasGradients);
 
     tcnn::mma_mat<16, 16, tcnn::CM> weightsOutput =
-        tcnn::mma_mat<16, 16, tcnn::CM>::from_linear_memory(weightsHidden1);     // 16x8
-    auto hiddenGradientMatrix = lossGradientMatrix * weightsOutput.transpose();  // 32x16
+        tcnn::mma_mat<16, 16, tcnn::CM>::from_linear_memory(weightsHidden1);      // 16x16
+    auto hiddenGradientMatrix = lossGradientMatrix * weightsOutput.transpose();   // 32x16
     tcnn::mma_vec<NT_HIDDEN_LAYER_SIZE> outputLayerInput(activatedHiddenLayer0); // 32x16
     hiddenGradientMatrix.activate_bwd<tcnn::Activation::ReLU>(outputLayerInput);
     SumRows<numThreads, NT_HIDDEN_LAYER_SIZE>(hiddenGradientMatrix, shmem, layer0BiasGradients);
 
     auto outputWeightGradientMatrix =
-        tcnn::outer_product(outputLayerInput, lossGradientMatrix); // 16x8
+        tcnn::outer_product(outputLayerInput, lossGradientMatrix); // 16x16
 
     // Write to memory
     SumIntoLinearGlobalMemoryHierarchicalFloat<numThreads>(

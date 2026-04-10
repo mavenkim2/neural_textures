@@ -36,7 +36,8 @@ NT_DEVICE inline float4 ZeroValue<float4>()
 // See http://vec3.ca/bicubic-filtering-in-fewer-taps/ for more details.
 template <typename T>
 NT_DEVICE inline T
-SampleTextureCatmullRom(cudaTextureObject_t texture, const float2 &uv, const float2 &texSize)
+SampleTextureCatmullRomLod(
+    cudaTextureObject_t texture, const float2 &uv, const float2 &texSize, float lod)
 {
     // We're going to sample a 4x4 grid of texels surrounding the target UV coordinate. We'll do
     // this by rounding down the sample location to get the exact center of our "starting" texel.
@@ -52,10 +53,10 @@ SampleTextureCatmullRom(cudaTextureObject_t texture, const float2 &uv, const flo
     // Compute the Catmull-Rom weights using the fractional offset that we calculated earlier.
     // These equations are pre-expanded based on our knowledge of where the texels will be located,
     // which lets us avoid having to evaluate a piece-wise function.
-    float2 w0 = f * (-0.5f + f * (1.0f - 0.5f * f));
-    float2 w1 = 1.0f + f * f * (-2.5f + 1.5f * f);
-    float2 w2 = f * (0.5f + f * (2.0f - 1.5f * f));
-    float2 w3 = f * f * (-0.5f + 0.5f * f);
+    float2 w0 = f * (f * (f * -0.5f + 1.0f) - 0.5f);
+    float2 w1 = f * f * (f * 1.5f - 2.5f) + 1.0f;
+    float2 w2 = f * (f * (f * -1.5f + 2.0f) + 0.5f);
+    float2 w3 = f * f * (f * 0.5f - 0.5f);
 
     // Work out weighting factors and sampling offsets that will let us use bilinear filtering to
     // simultaneously evaluate the middle 2 samples from the 4x4 grid.
@@ -72,19 +73,26 @@ SampleTextureCatmullRom(cudaTextureObject_t texture, const float2 &uv, const flo
     texPos12 = texPos12 / texSize;
 
     T result = ZeroValue<T>();
-    result += tex2D<T>(texture, texPos0.x, texPos0.y) * (w0.x * w0.y);
-    result += tex2D<T>(texture, texPos12.x, texPos0.y) * (w12.x * w0.y);
-    result += tex2D<T>(texture, texPos3.x, texPos0.y) * (w3.x * w0.y);
+    result += tex2DLod<T>(texture, texPos0.x, texPos0.y, lod) * (w0.x * w0.y);
+    result += tex2DLod<T>(texture, texPos12.x, texPos0.y, lod) * (w12.x * w0.y);
+    result += tex2DLod<T>(texture, texPos3.x, texPos0.y, lod) * (w3.x * w0.y);
 
-    result += tex2D<T>(texture, texPos0.x, texPos12.y) * (w0.x * w12.y);
-    result += tex2D<T>(texture, texPos12.x, texPos12.y) * (w12.x * w12.y);
-    result += tex2D<T>(texture, texPos3.x, texPos12.y) * (w3.x * w12.y);
+    result += tex2DLod<T>(texture, texPos0.x, texPos12.y, lod) * (w0.x * w12.y);
+    result += tex2DLod<T>(texture, texPos12.x, texPos12.y, lod) * (w12.x * w12.y);
+    result += tex2DLod<T>(texture, texPos3.x, texPos12.y, lod) * (w3.x * w12.y);
 
-    result += tex2D<T>(texture, texPos0.x, texPos3.y) * (w0.x * w3.y);
-    result += tex2D<T>(texture, texPos12.x, texPos3.y) * (w12.x * w3.y);
-    result += tex2D<T>(texture, texPos3.x, texPos3.y) * (w3.x * w3.y);
+    result += tex2DLod<T>(texture, texPos0.x, texPos3.y, lod) * (w0.x * w3.y);
+    result += tex2DLod<T>(texture, texPos12.x, texPos3.y, lod) * (w12.x * w3.y);
+    result += tex2DLod<T>(texture, texPos3.x, texPos3.y, lod) * (w3.x * w3.y);
 
     return result;
+}
+
+template <typename T>
+NT_DEVICE inline T
+SampleTextureCatmullRom(cudaTextureObject_t texture, const float2 &uv, const float2 &texSize)
+{
+    return SampleTextureCatmullRomLod<T>(texture, uv, texSize, 0.0f);
 }
 
 } // namespace neural_textures

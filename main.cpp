@@ -126,7 +126,8 @@ void CopyExrPixelToMip(const EXRHeader &header,
         }
         else
         {
-            destPixel[channelIndex] = reinterpret_cast<float **>(images)[channelIndex][sourceIndex];
+            destPixel[channelIndex] =
+                reinterpret_cast<float **>(images)[channelIndex][sourceIndex];
         }
     }
 
@@ -136,14 +137,15 @@ void CopyExrPixelToMip(const EXRHeader &header,
     }
 }
 
-std::vector<std::vector<float>>
-LoadExrMipChainFromTiles(const std::filesystem::path &path, const EXRHeader &exrHeader)
+std::vector<std::vector<float>> LoadExrMipChainFromTiles(const std::filesystem::path &path,
+                                                         const EXRHeader &exrHeader)
 {
     EXRImage exrImage;
     InitEXRImage(&exrImage);
 
     const char *errorMessage = nullptr;
-    const int result = LoadEXRImageFromFile(&exrImage, &exrHeader, path.string().c_str(), &errorMessage);
+    const int result =
+        LoadEXRImageFromFile(&exrImage, &exrHeader, path.string().c_str(), &errorMessage);
     if (result != TINYEXR_SUCCESS)
     {
         std::string message = "Failed to load tiled EXR image";
@@ -177,8 +179,8 @@ LoadExrMipChainFromTiles(const std::filesystem::path &path, const EXRHeader &exr
     {
         const int mipWidth = GetMipDimension(exrImage.width, mipLevel, roundUp);
         const int mipHeight = GetMipDimension(exrImage.height, mipLevel, roundUp);
-        mipPixels[(size_t)mipLevel].resize((size_t)mipWidth * (size_t)mipHeight * (size_t)cudaChannels,
-                                           0.f);
+        mipPixels[(size_t)mipLevel].resize(
+            (size_t)mipWidth * (size_t)mipHeight * (size_t)cudaChannels, 0.f);
     }
 
     for (int tileIndex = 0; tileIndex < exrImage.num_tiles; ++tileIndex)
@@ -355,20 +357,18 @@ UploadedTexture UploadTexture(const HostTexture &hostTexture)
     uploadedTexture.numMipLevels = hostTexture.numMipLevels;
 
     cudaChannelFormatDesc channelDesc = CreateChannelDesc(hostTexture.cudaChannels);
-    CheckCuda(cudaMallocMipmappedArray(&uploadedTexture.mipmappedArray,
-                                       &channelDesc,
-                                       make_cudaExtent((size_t)hostTexture.width,
-                                                       (size_t)hostTexture.height,
-                                                       0),
-                                       (unsigned int)hostTexture.numMipLevels),
+    CheckCuda(cudaMallocMipmappedArray(
+                  &uploadedTexture.mipmappedArray,
+                  &channelDesc,
+                  make_cudaExtent((size_t)hostTexture.width, (size_t)hostTexture.height, 0),
+                  (unsigned int)hostTexture.numMipLevels),
               "cudaMallocMipmappedArray");
 
     for (int mipLevel = 0; mipLevel < hostTexture.numMipLevels; ++mipLevel)
     {
         cudaArray_t levelArray = nullptr;
-        CheckCuda(cudaGetMipmappedArrayLevel(&levelArray,
-                                             uploadedTexture.mipmappedArray,
-                                             (unsigned int)mipLevel),
+        CheckCuda(cudaGetMipmappedArrayLevel(
+                      &levelArray, uploadedTexture.mipmappedArray, (unsigned int)mipLevel),
                   "cudaGetMipmappedArrayLevel");
 
         const int mipWidth = GetMipDimension(hostTexture.width, mipLevel, false);
@@ -484,15 +484,16 @@ int main(int argc, char *argv[])
 
         for (const UploadedTexture &texture : uploadedTextures)
         {
-            std::printf("Loaded %s (%dx%d, %d channel%s, cuda=%d, mips=%d) -> cudaTextureObject_t=%llu\n",
-                        texture.path.string().c_str(),
-                        texture.width,
-                        texture.height,
-                        texture.numChannels,
-                        texture.numChannels == 1 ? "" : "s",
-                        texture.cudaChannels,
-                        texture.numMipLevels,
-                        (unsigned long long)texture.texture);
+            std::printf(
+                "Loaded %s (%dx%d, %d channel%s, cuda=%d, mips=%d) -> cudaTextureObject_t=%llu\n",
+                texture.path.string().c_str(),
+                texture.width,
+                texture.height,
+                texture.numChannels,
+                texture.numChannels == 1 ? "" : "s",
+                texture.cudaChannels,
+                texture.numMipLevels,
+                (unsigned long long)texture.texture);
         }
 
         DestroyUploadedTextures(uploadedTextures);
@@ -505,7 +506,11 @@ int main(int argc, char *argv[])
         return 1;
     }
 
-#if 0
+    // 1. what rng am i using?
+    // 2. how do I initialize the features?
+    // 3. actually sampling the reference textures during training
+    // 4. set feature sizes
+#if 1
     const int unconstrainedThreshold = 5000;
     const int blockFeaturesThreshold = unconstrainedThreshold + 200000;
     const int maxIters = blockFeaturesThreshold + 1000;
@@ -530,7 +535,10 @@ int main(int argc, char *argv[])
 
         InvokeTraining(params, type);
         InvokeOptimizeNetwork(params);
-        InvokeOptimizeFeatures(params);
+        if (type != TrainingKernelType::FINALIZE)
+        {
+            InvokeOptimizeFeatures(params);
+        }
         params.step++;
     }
 #endif

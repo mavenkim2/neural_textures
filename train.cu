@@ -4,12 +4,14 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
+#include "filter/catmull_rom.h"
 #include "mlp.h"
 
 #include "train.h"
 #include "util/atomic.h"
 #include "util/float2.h"
 #include "util/float3.h"
+#include "util/float4.h"
 
 namespace neural_textures
 {
@@ -56,6 +58,71 @@ NT_DEVICE inline float BilinearWeight(const int2 &corner, const float2 &texelFra
     float wu = corner.x ? texelFrac.x : (1.f - texelFrac.x);
     float wv = corner.y ? texelFrac.y : (1.f - texelFrac.y);
     return wu * wv;
+}
+
+template <typename T>
+NT_DEVICE inline T SampleReferenceTextureTrilinear(const ReferenceTexture &texture,
+                                                   const float3 &uvs)
+{
+    const int maxMip = texture.numMipLevels > 0 ? texture.numMipLevels - 1 : 0;
+    const float mipCoord = Clamp(uvs.z, 0.f, (float)maxMip);
+    const int mip0 = min((int)floorf(mipCoord), maxMip);
+    const int mip1 = min(mip0 + 1, maxMip);
+    const float mipFrac = mip1 > mip0 ? (mipCoord - (float)mip0) : 0.f;
+
+    const float2 uv = make_float2(uvs.x, uvs.y);
+    const float2 texSize0 = make_float2((float)GetMipDimension(texture.width, mip0),
+                                        (float)GetMipDimension(texture.height, mip0));
+    T sample0 = SampleTextureCatmullRomLod<T>(texture.texture, uv, texSize0, (float)mip0);
+
+    if (mip1 == mip0)
+    {
+        return sample0;
+    }
+
+    const float2 texSize1 = make_float2((float)GetMipDimension(texture.width, mip1),
+                                        (float)GetMipDimension(texture.height, mip1));
+    T sample1 = SampleTextureCatmullRomLod<T>(texture.texture, uv, texSize1, (float)mip1);
+    return sample0 * (1.f - mipFrac) + sample1 * mipFrac;
+}
+
+NT_DEVICE inline void
+InitializeExpectedValues(const KernelParams &params, const float3 &uvs, float *expected)
+{
+    for (int i = 0; i < NT_OUTPUT_SIZE; ++i)
+    {
+        expected[i] = 0.f;
+    }
+
+    int outputChannel = 0;
+    const int textureCount = params.numReferenceTextures < NT_MAX_REFERENCE_TEXTURES
+                                 ? params.numReferenceTextures
+                                 : NT_MAX_REFERENCE_TEXTURES;
+
+    for (int textureIndex = 0; textureIndex < textureCount && outputChannel < NT_OUTPUT_SIZE;
+         ++textureIndex)
+    {
+        const ReferenceTexture &texture = params.referenceTextures[textureIndex];
+        if (texture.texture == 0 || texture.numChannels <= 0)
+        {
+            continue;
+        }
+
+        if (texture.numChannels == 1)
+        {
+            expected[outputChannel++] = SampleReferenceTextureTrilinear<float>(texture, uvs);
+            continue;
+        }
+
+        const float4 sample = SampleReferenceTextureTrilinear<float4>(texture, uvs);
+        const float channels[4] = {sample.x, sample.y, sample.z, sample.w};
+        const int channelCount = texture.numChannels < 4 ? texture.numChannels : 4;
+        for (int channelIndex = 0; channelIndex < channelCount && outputChannel < NT_OUTPUT_SIZE;
+             ++channelIndex)
+        {
+            expected[outputChannel++] = channels[channelIndex];
+        }
+    }
 }
 
 // Endpoints are train-time float parameters, then mapped through the BC6-compatible
@@ -567,8 +634,8 @@ NT_DEVICE void TrainLoopPass(KernelParams params)
         // TODO: feed the four sampled feature vectors into the MLP, compare against the
         // filtered reference material sample, and backpropagate into network + BC6 params.
 
-        // TODO: sample the reference textures
         float expected[NT_OUTPUT_SIZE] = {};
+        InitializeExpectedValues(params, uvs, expected);
 
         tcnn::hvec<NT_HIDDEN_LAYER_SIZE> activatedHiddenLayer0;
         tcnn::hvec<NT_OUTPUT_SIZE> outputVec = ForwardPass(sampledFeatures,
@@ -587,7 +654,7 @@ NT_DEVICE void TrainLoopPass(KernelParams params)
             float error = outputValue - expected[i];
             mse += error * error;
 
-            float loss = 2 * error / float(params.numSamples);
+            float loss = 2.f * error / float(params.numSamples);
             lossGradient[i] = __float2half(loss);
         }
 

@@ -1,19 +1,21 @@
 #pragma once
 #include <cstdint>
 #include <cuda_fp16.h>
+#include <cuda_runtime.h>
 
 namespace neural_textures
 {
 
 #define NT_INPUT_SIZE 12
 #define NT_HIDDEN_LAYER_SIZE 16
-#define NT_OUTPUT_SIZE 8
+#define NT_OUTPUT_SIZE 16
 
 #define half __half
 
 #define NT_NUM_NETWORK_LAYERS 2
 #define NT_NUM_BC6_PIXELS_PER_BLOCK 16
 #define NT_NUM_FEATURES 4
+#define NT_MAX_REFERENCE_TEXTURES 16
 
 enum class TrainingKernelType
 {
@@ -61,6 +63,15 @@ struct Feature
     int height;
 };
 
+struct ReferenceTexture
+{
+    cudaTextureObject_t texture = 0;
+    int width = 0;
+    int height = 0;
+    int numChannels = 0;
+    int numMipLevels = 0;
+};
+
 struct KernelParams
 {
     // params[mip][v * numU + u]
@@ -79,6 +90,9 @@ struct KernelParams
 
     AdamConstants networkAdam;
     AdamConstants featureAdam;
+
+    ReferenceTexture referenceTextures[NT_MAX_REFERENCE_TEXTURES];
+    int numReferenceTextures = 0;
 
     int imageWidth;
     int imageHeight;
