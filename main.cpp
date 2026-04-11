@@ -178,14 +178,22 @@ void UploadHostVector(T *deviceBuffer, const std::vector<T> &hostData, const cha
         operation);
 }
 
-std::vector<half>
-InitializeNetworkWeights(size_t totalCount, size_t activeCount, std::mt19937 &rng, float scale)
+std::vector<half> InitializeNetworkWeightMatrix(size_t paddedRows,
+                                                size_t paddedCols,
+                                                size_t activeRows,
+                                                size_t activeCols,
+                                                std::mt19937 &rng,
+                                                float scale)
 {
     std::uniform_real_distribution<float> distribution(-scale, scale);
-    std::vector<half> weights(totalCount, __float2half(0.f));
-    for (size_t index = 0; index < activeCount; ++index)
+    std::vector<half> weights(paddedRows * paddedCols, __float2half(0.f));
+    for (size_t col = 0; col < activeCols; ++col)
     {
-        weights[index] = __float2half(distribution(rng));
+        for (size_t row = 0; row < activeRows; ++row)
+        {
+            const size_t linearIndex = col * paddedRows + row;
+            weights[linearIndex] = __float2half(distribution(rng));
+        }
     }
 
     return weights;
@@ -246,6 +254,33 @@ int GetPackedChannelCount(const std::vector<HostTexture> &textures)
     }
 
     return channelCount;
+}
+
+void ZeroUnusedOutputChannels(KernelParams &params, int usedChannelCount)
+{
+    const int clampedUsedChannels = std::clamp(usedChannelCount, 0, NT_OUTPUT_SIZE);
+    if (clampedUsedChannels >= NT_OUTPUT_SIZE)
+    {
+        return;
+    }
+
+    constexpr int kOutputLayerIndex = 1;
+    constexpr size_t kPaddedRows = NT_HIDDEN_LAYER_SIZE;
+    constexpr size_t kBiasCount = NT_HIDDEN_LAYER_SIZE;
+
+    for (int outputChannel = clampedUsedChannels; outputChannel < NT_OUTPUT_SIZE; ++outputChannel)
+    {
+        half *weightColumnStart =
+            params.networkWeights[kOutputLayerIndex] + (size_t)outputChannel * kPaddedRows;
+        CheckCuda(cudaMemset(weightColumnStart, 0, kPaddedRows * sizeof(half)),
+                  "cudaMemset(unused output weights)");
+    }
+
+    half *biasStart = params.networkBiases[kOutputLayerIndex] + clampedUsedChannels;
+    CheckCuda(cudaMemset(biasStart,
+                         0,
+                         (kBiasCount - (size_t)clampedUsedChannels) * sizeof(half)),
+              "cudaMemset(unused output biases)");
 }
 
 uint8_t FloatToUnorm8(float value)
@@ -678,9 +713,13 @@ void InitializeNetworkStorage(KernelParams &params, std::mt19937 &rng)
 {
     constexpr size_t paddedWeightCount = NT_HIDDEN_LAYER_SIZE * NT_HIDDEN_LAYER_SIZE;
     constexpr size_t biasCount = NT_HIDDEN_LAYER_SIZE;
-    const size_t activeWeightCounts[NT_NUM_NETWORK_LAYERS] = {
-        NT_HIDDEN_LAYER_SIZE * NT_INPUT_SIZE,
-        NT_HIDDEN_LAYER_SIZE * NT_OUTPUT_SIZE,
+    const size_t activeWeightRows[NT_NUM_NETWORK_LAYERS] = {
+        NT_INPUT_SIZE,
+        NT_HIDDEN_LAYER_SIZE,
+    };
+    const size_t activeWeightCols[NT_NUM_NETWORK_LAYERS] = {
+        NT_HIDDEN_LAYER_SIZE,
+        NT_OUTPUT_SIZE,
     };
 
     for (int layer = 0; layer < NT_NUM_NETWORK_LAYERS; ++layer)
@@ -694,8 +733,12 @@ void InitializeNetworkStorage(KernelParams &params, std::mt19937 &rng)
         params.networkWeightMoment2[layer] =
             AllocateDeviceBuffer<float>(paddedWeightCount, "cudaMalloc(networkWeightMoment2)");
 
-        std::vector<half> weights =
-            InitializeNetworkWeights(paddedWeightCount, activeWeightCounts[layer], rng, 1e-2f);
+        std::vector<half> weights = InitializeNetworkWeightMatrix(NT_HIDDEN_LAYER_SIZE,
+                                                                  NT_HIDDEN_LAYER_SIZE,
+                                                                  activeWeightRows[layer],
+                                                                  activeWeightCols[layer],
+                                                                  rng,
+                                                                  1e-2f);
         UploadHostVector(params.networkWeights[layer], weights, "cudaMemcpy(networkWeights)");
         ZeroDeviceBuffer(params.networkWeightGradients[layer],
                          paddedWeightCount,
@@ -885,6 +928,7 @@ int main(int argc, char *argv[])
             uploadedTextures.push_back(UploadTexture(hostTexture));
         }
 
+        ZeroUnusedOutputChannels(params, GetPackedChannelCount(hostTextures));
         InitializeReferenceTextures(params, uploadedTextures);
         params.imageWidth =
             uploadedTextures.empty() ? params.imageWidth : uploadedTextures[0].width;
@@ -939,7 +983,7 @@ int main(int argc, char *argv[])
 #if 1
         const int unconstrainedThreshold = 5000;
         // const int blockFeaturesThreshold = unconstrainedThreshold + 200000;
-        const int blockFeaturesThreshold = unconstrainedThreshold + 10000;
+        const int blockFeaturesThreshold = unconstrainedThreshold + 5000;
         const int maxIters = blockFeaturesThreshold + 1000;
         const int progressInterval = 1000;
         constexpr int kTrainingRegionSize = 512;

@@ -572,6 +572,41 @@ NT_DEVICE inline void OptimizeParameterBuffer(half *weights,
     }
 }
 
+NT_DEVICE inline void OptimizePaddedParameterMatrix(half *weights,
+                                                    float *gradients,
+                                                    float *moment1,
+                                                    float *moment2,
+                                                    int activeRows,
+                                                    int activeCols,
+                                                    int paddedRows,
+                                                    const AdamConstants &adam,
+                                                    int step)
+{
+    const int threadId = blockIdx.x * blockDim.x + threadIdx.x;
+    const int threadCount = gridDim.x * blockDim.x;
+    const int activeCount = activeRows * activeCols;
+
+    for (int activeIndex = threadId; activeIndex < activeCount; activeIndex += threadCount)
+    {
+        const int row = activeIndex % activeRows;
+        const int col = activeIndex / activeRows;
+        const int linearIndex = col * paddedRows + row;
+        const float gradient = gradients[linearIndex];
+        if (gradient == 0.f)
+        {
+            continue;
+        }
+
+        AdamUpdateParameter(moment1[linearIndex],
+                            moment2[linearIndex],
+                            gradient,
+                            adam,
+                            step,
+                            weights[linearIndex]);
+        gradients[linearIndex] = 0.f;
+    }
+}
+
 NT_DEVICE inline void OptimizeFeatureScalar(float &weight,
                                             float &gradient,
                                             float &moment1,
@@ -630,9 +665,14 @@ NT_DEVICE inline void OptimizeFeatureBlock(BC6Parameters &parameters,
 
 NT_DEVICE inline void OptimizeNetworkPass(KernelParams params)
 {
-    constexpr int weightCounts[NT_NUM_NETWORK_LAYERS] = {
-        NT_HIDDEN_LAYER_SIZE * NT_INPUT_SIZE,
-        NT_HIDDEN_LAYER_SIZE * NT_OUTPUT_SIZE,
+    constexpr int paddedWeightRows = NT_HIDDEN_LAYER_SIZE;
+    constexpr int weightRows[NT_NUM_NETWORK_LAYERS] = {
+        NT_INPUT_SIZE,
+        NT_HIDDEN_LAYER_SIZE,
+    };
+    constexpr int weightCols[NT_NUM_NETWORK_LAYERS] = {
+        NT_HIDDEN_LAYER_SIZE,
+        NT_OUTPUT_SIZE,
     };
     constexpr int biasCounts[NT_NUM_NETWORK_LAYERS] = {
         NT_HIDDEN_LAYER_SIZE,
@@ -641,13 +681,15 @@ NT_DEVICE inline void OptimizeNetworkPass(KernelParams params)
 
     for (int layer = 0; layer < NT_NUM_NETWORK_LAYERS; ++layer)
     {
-        OptimizeParameterBuffer(params.networkWeights[layer],
-                                params.networkWeightGradients[layer],
-                                params.networkWeightMoment1[layer],
-                                params.networkWeightMoment2[layer],
-                                weightCounts[layer],
-                                params.networkAdam,
-                                params.step);
+        OptimizePaddedParameterMatrix(params.networkWeights[layer],
+                                      params.networkWeightGradients[layer],
+                                      params.networkWeightMoment1[layer],
+                                      params.networkWeightMoment2[layer],
+                                      weightRows[layer],
+                                      weightCols[layer],
+                                      paddedWeightRows,
+                                      params.networkAdam,
+                                      params.step);
 
         OptimizeParameterBuffer(params.networkBiases[layer],
                                 params.networkBiasGradients[layer],
