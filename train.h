@@ -104,6 +104,9 @@ struct KernelParams
     int numBlocksU;
     int numBlocksV;
 
+    int texelOffsetX;
+    int texelOffsetY;
+
     int numSamples;
     int step = 0;
 };

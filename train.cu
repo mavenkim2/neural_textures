@@ -759,8 +759,10 @@ NT_DEVICE void TrainLoopPass(KernelParams params)
     }
 
     constexpr int kTrainingRegionSize = 512;
-    const uint32_t sampleX = sampleIndex % kTrainingRegionSize;
-    const uint32_t sampleY = sampleIndex / kTrainingRegionSize;
+    const uint32_t threadX = sampleIndex % kTrainingRegionSize;
+    const uint32_t threadY = sampleIndex / kTrainingRegionSize;
+    const uint32_t sampleX = params.texelOffsetX + threadX;
+    const uint32_t sampleY = params.texelOffsetY + threadY;
 
     RNG rng(sampleIndex ^ ((uint32_t)params.step * 747796405u + 2891336453u));
 

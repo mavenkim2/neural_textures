@@ -939,12 +939,22 @@ int main(int argc, char *argv[])
 #if 1
         const int unconstrainedThreshold = 5000;
         // const int blockFeaturesThreshold = unconstrainedThreshold + 200000;
-        const int blockFeaturesThreshold = unconstrainedThreshold + 5000;
+        const int blockFeaturesThreshold = unconstrainedThreshold + 10000;
         const int maxIters = blockFeaturesThreshold + 1000;
         const int progressInterval = 1000;
+        constexpr int kTrainingRegionSize = 512;
+        const int maxRegionOffsetX = std::max(0, params.imageWidth - kTrainingRegionSize);
+        const int maxRegionOffsetY = std::max(0, params.imageHeight - kTrainingRegionSize);
+        const float baseFeatureLearningRate = params.featureAdam.learningRate;
+        constexpr float kUnconstrainedFeatureGamma = 0.9995f;
+        constexpr float kBlockFeatureGamma = 0.9999f;
         const auto trainingStart = std::chrono::steady_clock::now();
 
         std::printf("Starting training for %d iterations\n", maxIters);
+
+        std::mt19937 regionRng(20260411u);
+        std::uniform_int_distribution<int> randomRegionX(0, maxRegionOffsetX);
+        std::uniform_int_distribution<int> randomRegionY(0, maxRegionOffsetY);
 
         for (int iter = 0; iter < maxIters; iter++)
         {
@@ -952,14 +962,23 @@ int main(int argc, char *argv[])
             // {
             // }
 
+            params.texelOffsetX = randomRegionX(regionRng);
+            params.texelOffsetY = randomRegionY(regionRng);
+
             TrainingKernelType type;
             if (iter < unconstrainedThreshold)
             {
                 type = TrainingKernelType::UNCONSTRAINED;
+                params.featureAdam.learningRate =
+                    baseFeatureLearningRate * std::pow(kUnconstrainedFeatureGamma, (float)iter);
             }
             else if (iter < blockFeaturesThreshold)
             {
                 type = TrainingKernelType::BLOCK_FEATURES;
+                const int blockFeatureIter = iter - unconstrainedThreshold;
+                params.featureAdam.learningRate =
+                    baseFeatureLearningRate *
+                    std::pow(kBlockFeatureGamma, (float)std::max(blockFeatureIter, 0));
             }
             else
             {
@@ -968,6 +987,8 @@ int main(int argc, char *argv[])
 
             // NOTE: temporary
             type = TrainingKernelType::UNCONSTRAINED;
+            params.featureAdam.learningRate =
+                baseFeatureLearningRate * std::pow(kUnconstrainedFeatureGamma, (float)iter);
 
             InvokeTraining(params, type);
             InvokeOptimizeNetwork(params);
