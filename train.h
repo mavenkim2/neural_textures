@@ -95,6 +95,9 @@ struct KernelParams
     ReferenceTexture referenceTextures[NT_MAX_REFERENCE_TEXTURES];
     int numReferenceTextures = 0;
 
+    float *inferenceOutput = nullptr;
+    float *inferenceMseAccum = nullptr;
+
     int imageWidth;
     int imageHeight;
     int numMips;
@@ -105,6 +108,7 @@ struct KernelParams
     int step = 0;
 };
 void InvokeOptimizeNetwork(KernelParams params);
-void InvokeOptimizeFeatures(KernelParams params);
+void InvokeOptimizeFeatures(KernelParams params, TrainingKernelType type);
 void InvokeTraining(KernelParams params, TrainingKernelType type);
+void InvokeInference(KernelParams params);
 } // namespace neural_textures

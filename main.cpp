@@ -21,6 +21,9 @@
 
 #define TINYEXR_IMPLEMENTATION
 #include <tinyexr.h>
+
+#define STB_IMAGE_WRITE_IMPLEMENTATION
+#include <stbi/stb_image_write.h>
 #endif
 
 namespace
@@ -226,6 +229,29 @@ int GetBlockCountForDimension(int size)
 {
     int numBlocks = size >> 2;
     return numBlocks > 0 ? numBlocks : 1;
+}
+
+int GetPackedChannelCount(const std::vector<HostTexture> &textures)
+{
+    int channelCount = 0;
+    for (const HostTexture &texture : textures)
+    {
+        const int textureChannels =
+            texture.numChannels == 1 ? 1 : std::min(texture.numChannels, 4);
+        channelCount += textureChannels;
+        if (channelCount >= NT_OUTPUT_SIZE)
+        {
+            return NT_OUTPUT_SIZE;
+        }
+    }
+
+    return channelCount;
+}
+
+uint8_t FloatToUnorm8(float value)
+{
+    const float clamped = std::clamp(value, 0.f, 1.f);
+    return (uint8_t)std::lround(clamped * 255.f);
 }
 
 bool ChannelLoadsAsUint(const EXRHeader &header, int channelIndex)
@@ -756,6 +782,57 @@ void InitializeReferenceTextures(neural_textures::KernelParams &params,
     }
 }
 
+void SaveInferencePngs(const std::filesystem::path &outputDirectory,
+                       const std::vector<HostTexture> &hostTextures,
+                       const std::vector<float> &inferenceOutput,
+                       int width,
+                       int height)
+{
+    std::filesystem::create_directories(outputDirectory);
+
+    int outputChannelBase = 0;
+    const size_t pixelCount = (size_t)width * (size_t)height;
+    for (const HostTexture &texture : hostTextures)
+    {
+        const int textureChannels =
+            texture.numChannels == 1 ? 1 : std::min(texture.numChannels, 4);
+        if (outputChannelBase >= NT_OUTPUT_SIZE)
+        {
+            break;
+        }
+
+        const int savedChannels = std::min(textureChannels, NT_OUTPUT_SIZE - outputChannelBase);
+        std::vector<uint8_t> pngPixels(pixelCount * (size_t)savedChannels);
+        for (size_t pixelIndex = 0; pixelIndex < pixelCount; ++pixelIndex)
+        {
+            const size_t outputBase =
+                pixelIndex * (size_t)NT_OUTPUT_SIZE + (size_t)outputChannelBase;
+            const size_t pngBase = pixelIndex * (size_t)savedChannels;
+            for (int channelIndex = 0; channelIndex < savedChannels; ++channelIndex)
+            {
+                pngPixels[pngBase + (size_t)channelIndex] =
+                    FloatToUnorm8(inferenceOutput[outputBase + (size_t)channelIndex]);
+            }
+        }
+
+        const std::filesystem::path outputPath =
+            outputDirectory / (texture.path.stem().string() + "_inference.png");
+        const int strideBytes = width * savedChannels;
+        if (stbi_write_png(outputPath.string().c_str(),
+                           width,
+                           height,
+                           savedChannels,
+                           pngPixels.data(),
+                           strideBytes) == 0)
+        {
+            throw std::runtime_error("Failed to write PNG: " + outputPath.string());
+        }
+
+        std::printf("Wrote inference PNG %s\n", outputPath.string().c_str());
+        outputChannelBase += textureChannels;
+    }
+}
+
 #endif
 
 } // namespace
@@ -853,9 +930,16 @@ int main(int argc, char *argv[])
                 (unsigned long long)texture.texture);
         }
 
+        const size_t inferenceSampleCount = (size_t)params.imageWidth * (size_t)params.imageHeight;
+        params.inferenceOutput = AllocateDeviceBuffer<float>(
+            inferenceSampleCount * (size_t)NT_OUTPUT_SIZE, "cudaMalloc(inferenceOutput)");
+        params.inferenceMseAccum = AllocateDeviceBuffer<float>(1, "cudaMalloc(inferenceMseAccum)");
+        ZeroDeviceBuffer(params.inferenceMseAccum, (size_t)1, "cudaMemset(inferenceMseAccum)");
+
 #if 1
         const int unconstrainedThreshold = 5000;
-        const int blockFeaturesThreshold = unconstrainedThreshold + 200000;
+        // const int blockFeaturesThreshold = unconstrainedThreshold + 200000;
+        const int blockFeaturesThreshold = unconstrainedThreshold + 5000;
         const int maxIters = blockFeaturesThreshold + 1000;
         const int progressInterval = 1000;
         const auto trainingStart = std::chrono::steady_clock::now();
@@ -882,13 +966,14 @@ int main(int argc, char *argv[])
                 type = TrainingKernelType::FINALIZE;
             }
 
+            // NOTE: temporary
             type = TrainingKernelType::UNCONSTRAINED;
 
             InvokeTraining(params, type);
             InvokeOptimizeNetwork(params);
             if (type != TrainingKernelType::FINALIZE)
             {
-                InvokeOptimizeFeatures(params);
+                InvokeOptimizeFeatures(params, type);
             }
             params.step++;
 
@@ -902,7 +987,46 @@ int main(int argc, char *argv[])
                     "Completed iteration %d / %d (%.2fs)\n", iter + 1, maxIters, elapsedSeconds);
             }
         }
+
+        ZeroDeviceBuffer(params.inferenceMseAccum, (size_t)1, "cudaMemset(inferenceMseAccum)");
+        InvokeInference(params);
+        CheckCuda(cudaDeviceSynchronize(), "cudaDeviceSynchronize(inference)");
+
+        std::vector<float> hostInference(inferenceSampleCount * (size_t)NT_OUTPUT_SIZE);
+        float hostMseAccum = 0.f;
+        CheckCuda(cudaMemcpy(hostInference.data(),
+                             params.inferenceOutput,
+                             hostInference.size() * sizeof(float),
+                             cudaMemcpyDeviceToHost),
+                  "cudaMemcpy(inferenceOutput)");
+        CheckCuda(
+            cudaMemcpy(
+                &hostMseAccum, params.inferenceMseAccum, sizeof(float), cudaMemcpyDeviceToHost),
+            "cudaMemcpy(inferenceMseAccum)");
+
+        const int packedChannelCount = std::max(1, GetPackedChannelCount(hostTextures));
+        const double mse =
+            (double)hostMseAccum / ((double)inferenceSampleCount * (double)packedChannelCount);
+        std::printf("Inference MSE: %.8f\n", mse);
+
+        SaveInferencePngs(std::filesystem::current_path() / "inference_outputs",
+                          hostTextures,
+                          hostInference,
+                          params.imageWidth,
+                          params.imageHeight);
 #endif
+
+        if (params.inferenceOutput != nullptr)
+        {
+            cudaFree(params.inferenceOutput);
+            params.inferenceOutput = nullptr;
+        }
+
+        if (params.inferenceMseAccum != nullptr)
+        {
+            cudaFree(params.inferenceMseAccum);
+            params.inferenceMseAccum = nullptr;
+        }
 
         DestroyUploadedTextures(uploadedTextures);
         return 0;

@@ -215,6 +215,13 @@ NT_HOST_DEVICE inline int GetNumBlocksAtMip(const Feature &feature, int mip)
     return GetBlockCountForDimension(width) * GetBlockCountForDimension(height);
 }
 
+NT_HOST_DEVICE inline int GetNumTexelsAtMip(const Feature &feature, int mip)
+{
+    int width = GetMipDimension(feature.width, mip);
+    int height = GetMipDimension(feature.height, mip);
+    return width * height;
+}
+
 NT_DEVICE inline float3 SampleBC6FeatureTexel(const BC6Parameters *texture,
                                               int numBlocksU,
                                               int imageWidth,
@@ -236,6 +243,59 @@ NT_DEVICE inline float3 SampleBC6FeatureTexel(const BC6Parameters *texture,
 
     const int endpointBits = gBC6HPartitionNumBits[bc6Params.mode];
     return DecompressBC6(endpoint0, endpoint1, endpointBits, pixelIndexOnSegment);
+}
+
+NT_DEVICE inline void
+SampleUnconstrainedFeaturesTrilinear(const KernelParams &params, float3 uvs, half *outFeatures)
+{
+    int mipBase = (int)floorf(uvs.z);
+    float mipFrac = uvs.z - floorf(uvs.z);
+
+    for (int featureIndex = 0; featureIndex < NT_NUM_FEATURES * 3; ++featureIndex)
+    {
+        outFeatures[featureIndex] = 0;
+    }
+
+    for (int featureIndex = 0; featureIndex < NT_NUM_FEATURES; ++featureIndex)
+    {
+        const Feature &feature = params.features[featureIndex];
+        const int maxMip = feature.numMips > 0 ? feature.numMips - 1 : 0;
+        const int maxMipIndex = mipFrac > 0.f ? 1 : 0;
+        for (int mipIndex = 0; mipIndex <= maxMipIndex; mipIndex++)
+        {
+            int mip = min(mipBase + mipIndex, maxMip);
+            const float3 *texture = feature.unconstrainedGrid[mip];
+
+            int width = max(feature.width >> mip, 1);
+            int height = max(feature.height >> mip, 1);
+
+            float2 imageSize = make_float2(float(width), float(height));
+            float2 texelUV = make_float2(uvs.x, uvs.y) * imageSize - 0.5f;
+            float2 texelBaseUV = Floor(texelUV);
+            int2 texelBase = make_int2(int(texelBaseUV.x), int(texelBaseUV.y));
+            float2 texelFrac = texelUV - texelBaseUV;
+
+            // TODO: unroll?
+            for (int corner = 0; corner < 4; corner++)
+            {
+                int cornerX = corner & 1;
+                int cornerY = corner >> 1;
+
+                int texelX = texelBase.x + cornerX;
+                int texelY = texelBase.y + cornerY;
+                texelX = WrapTexelCoord(texelX, width);
+                texelY = WrapTexelCoord(texelY, height);
+                float weight = (mipIndex ? mipFrac : 1.f - mipFrac) *
+                               BilinearWeight(make_int2(cornerX, cornerY), texelFrac);
+
+                float3 feature = weight * texture[width * texelY + texelX];
+
+                outFeatures[3 * featureIndex] += __float2half(feature.x);
+                outFeatures[3 * featureIndex + 1] += __float2half(feature.y);
+                outFeatures[3 * featureIndex + 2] += __float2half(feature.z);
+            }
+        }
+    }
 }
 
 NT_DEVICE inline void
@@ -420,16 +480,14 @@ NT_DEVICE inline void BackwardUnconstrainedFeaturePass(
                 float weight = (mipIndex ? mipFrac : 1.f - mipFrac) *
                                BilinearWeight(make_int2(cornerX, cornerY), texelFrac);
 
-                const int pixelIndex = GetBlockPixelIndex(texelX, texelY);
-                const int paramIndex = GetBlockParamIndex(texelX, texelY, numBlocksU);
-
-                float3 *texture = feature.unconstrainedGrid[mip];
+                const int texelIndex = texelY * width + texelX;
+                float3 *texture = feature.unconstrainedGradients[mip];
 
                 float3 featureGrad =
                     weight * make_float3(float(inputGradient[3 * featureIndex]),
                                          float(inputGradient[3 * featureIndex + 1]),
                                          float(inputGradient[3 * featureIndex + 2]));
-                atomicAdd(texture + paramIndex, featureGrad);
+                atomicAdd(texture + texelIndex, featureGrad);
             }
         }
     }
@@ -637,6 +695,60 @@ NT_DEVICE inline void OptimizeFeaturePass(KernelParams params)
     }
 }
 
+NT_DEVICE inline void OptimizeUnconstrainedFeaturePass(KernelParams params)
+{
+    const int linearThreadIndex = blockIdx.x * blockDim.x + threadIdx.x;
+    const int threadCount = gridDim.x * blockDim.x;
+    int baseTexelIndex = 0;
+
+    for (int featureIndex = 0; featureIndex < NT_NUM_FEATURES; ++featureIndex)
+    {
+        Feature &feature = params.features[featureIndex];
+        for (int mip = 0; mip < feature.numMips; ++mip)
+        {
+            const int numTexels = GetNumTexelsAtMip(feature, mip);
+            const int segmentEnd = baseTexelIndex + numTexels;
+
+            for (int linearTexelIndex = linearThreadIndex; linearTexelIndex < segmentEnd;
+                 linearTexelIndex += threadCount)
+            {
+                if (linearTexelIndex < baseTexelIndex)
+                {
+                    continue;
+                }
+
+                const int texelIndex = linearTexelIndex - baseTexelIndex;
+                float3 &weight = feature.unconstrainedGrid[mip][texelIndex];
+                float3 &gradient = feature.unconstrainedGradients[mip][texelIndex];
+                float3 &moment1 = feature.unconstrainedMoment1[mip][texelIndex];
+                float3 &moment2 = feature.unconstrainedMoment2[mip][texelIndex];
+
+                OptimizeFeatureScalar(
+                    weight.x, gradient.x, moment1.x, moment2.x, params.featureAdam, params.step);
+                OptimizeFeatureScalar(
+                    weight.y, gradient.y, moment1.y, moment2.y, params.featureAdam, params.step);
+                OptimizeFeatureScalar(
+                    weight.z, gradient.z, moment1.z, moment2.z, params.featureAdam, params.step);
+            }
+
+            baseTexelIndex = segmentEnd;
+        }
+    }
+}
+
+template <TrainingKernelType type>
+NT_DEVICE inline void OptimizeFeaturesPass(KernelParams params)
+{
+    if constexpr (type == TrainingKernelType::UNCONSTRAINED)
+    {
+        OptimizeUnconstrainedFeaturePass(params);
+    }
+    else
+    {
+        OptimizeFeaturePass(params);
+    }
+}
+
 template <uint32_t numThreads, TrainingKernelType type>
 NT_DEVICE void TrainLoopPass(KernelParams params)
 {
@@ -655,14 +767,23 @@ NT_DEVICE void TrainLoopPass(KernelParams params)
     {
         float jitterX = rng.UniformFloat() - 0.5f;
         float jitterY = rng.UniformFloat() - 0.5f;
-        float samplePosX = Clamp((float)sampleX + 0.5f + jitterX, 0.5f, (float)params.imageWidth - 0.5f);
-        float samplePosY = Clamp((float)sampleY + 0.5f + jitterY, 0.5f, (float)params.imageHeight - 0.5f);
+        float samplePosX =
+            Clamp((float)sampleX + 0.5f + jitterX, 0.5f, (float)params.imageWidth - 0.5f);
+        float samplePosY =
+            Clamp((float)sampleY + 0.5f + jitterY, 0.5f, (float)params.imageHeight - 0.5f);
         float u = samplePosX / (float)params.imageWidth;
         float v = samplePosY / (float)params.imageHeight;
         float3 uvs = make_float3(u, v, 0.f);
 
         half sampledFeatures[NT_NUM_FEATURES * 3];
-        SampleFourFeaturesTrilinear(params, uvs, sampledFeatures);
+        if constexpr (type == TrainingKernelType::UNCONSTRAINED)
+        {
+            SampleUnconstrainedFeaturesTrilinear(params, uvs, sampledFeatures);
+        }
+        else
+        {
+            SampleFourFeaturesTrilinear(params, uvs, sampledFeatures);
+        }
 
         // TODO: feed the four sampled feature vectors into the MLP, compare against the
         // filtered reference material sample, and backpropagate into network + BC6 params.
@@ -714,14 +835,64 @@ NT_DEVICE void TrainLoopPass(KernelParams params)
     }
 }
 
+NT_DEVICE void Inference(KernelParams params)
+{
+    const uint32_t sampleIndex = blockIdx.x * blockDim.x + threadIdx.x;
+    const uint32_t numInferenceSamples = (uint32_t)(params.imageWidth * params.imageHeight);
+    if (sampleIndex >= numInferenceSamples)
+    {
+        return;
+    }
+
+    const uint32_t sampleX = sampleIndex % (uint32_t)params.imageWidth;
+    const uint32_t sampleY = sampleIndex / (uint32_t)params.imageWidth;
+
+    const float samplePosX = (float)sampleX + 0.5f;
+    const float samplePosY = (float)sampleY + 0.5f;
+    const float u = samplePosX / (float)params.imageWidth;
+    const float v = samplePosY / (float)params.imageHeight;
+    const float3 uvs = make_float3(u, v, 0.f);
+
+    half sampledFeatures[NT_NUM_FEATURES * 3];
+    SampleUnconstrainedFeaturesTrilinear(params, uvs, sampledFeatures);
+
+    float expected[NT_OUTPUT_SIZE] = {};
+    InitializeExpectedValues(params, uvs, expected);
+
+    tcnn::hvec<NT_OUTPUT_SIZE> outputVec = ForwardPass(sampledFeatures,
+                                                       params.networkWeights[0],
+                                                       params.networkWeights[1],
+                                                       params.networkBiases[0],
+                                                       params.networkBiases[1]);
+
+    float sampleSse = 0.f;
+    const uint32_t outputBaseIndex = sampleIndex * NT_OUTPUT_SIZE;
+    for (int i = 0; i < NT_OUTPUT_SIZE; ++i)
+    {
+        const float outputValue = __half2float(outputVec[i]);
+        params.inferenceOutput[outputBaseIndex + (uint32_t)i] = outputValue;
+
+        const float error = outputValue - expected[i];
+        sampleSse += error * error;
+    }
+
+    atomicAdd(params.inferenceMseAccum, sampleSse);
+}
+
 __global__ void OptimizeNetwork(KernelParams params)
 {
     OptimizeNetworkPass(params);
 }
 
+template <TrainingKernelType type>
 __global__ void OptimizeFeatures(KernelParams params)
 {
-    OptimizeFeaturePass(params);
+    OptimizeFeaturesPass<type>(params);
+}
+
+__global__ void RunInference(KernelParams params)
+{
+    Inference(params);
 }
 
 template <uint32_t numThreads, TrainingKernelType type>
@@ -735,26 +906,42 @@ void InvokeOptimizeNetwork(KernelParams params)
     OptimizeNetwork<<<1, 32>>>(params);
 }
 
-void InvokeOptimizeFeatures(KernelParams params)
+void InvokeOptimizeFeatures(KernelParams params, TrainingKernelType type)
 {
-    int totalBlocks = 0;
+    int totalElements = 0;
     for (int featureIndex = 0; featureIndex < NT_NUM_FEATURES; ++featureIndex)
     {
         const Feature &feature = params.features[featureIndex];
         for (int mip = 0; mip < feature.numMips; ++mip)
         {
-            totalBlocks += GetNumBlocksAtMip(feature, mip);
+            if (type == TrainingKernelType::UNCONSTRAINED)
+            {
+                totalElements += GetNumTexelsAtMip(feature, mip);
+            }
+            else
+            {
+                totalElements += GetNumBlocksAtMip(feature, mip);
+            }
         }
     }
 
-    if (totalBlocks == 0)
+    if (totalElements == 0)
     {
         return;
     }
 
     constexpr int kThreadsPerBlock = 128;
-    const int numBlocks = (totalBlocks + kThreadsPerBlock - 1) / kThreadsPerBlock;
-    OptimizeFeatures<<<numBlocks, kThreadsPerBlock>>>(params);
+    const int numBlocks = (totalElements + kThreadsPerBlock - 1) / kThreadsPerBlock;
+    if (type == TrainingKernelType::UNCONSTRAINED)
+    {
+        OptimizeFeatures<TrainingKernelType::UNCONSTRAINED>
+            <<<numBlocks, kThreadsPerBlock>>>(params);
+    }
+    else
+    {
+        OptimizeFeatures<TrainingKernelType::BLOCK_FEATURES>
+            <<<numBlocks, kThreadsPerBlock>>>(params);
+    }
 }
 
 void InvokeTraining(KernelParams params, TrainingKernelType type)
@@ -777,6 +964,20 @@ void InvokeTraining(KernelParams params, TrainingKernelType type)
         TrainLoop<kThreadsPerBlock, TrainingKernelType::FINALIZE>
             <<<numBlocks, kThreadsPerBlock>>>(params);
     }
+}
+
+void InvokeInference(KernelParams params)
+{
+    const int numSamples = params.imageWidth * params.imageHeight;
+    if (numSamples <= 0 || params.inferenceOutput == nullptr ||
+        params.inferenceMseAccum == nullptr)
+    {
+        return;
+    }
+
+    const int kThreadsPerBlock = 256;
+    const int numBlocks = (numSamples + kThreadsPerBlock - 1) / kThreadsPerBlock;
+    RunInference<<<numBlocks, kThreadsPerBlock>>>(params);
 }
 
 } // namespace neural_textures
