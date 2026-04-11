@@ -94,6 +94,7 @@ struct KernelParams
 
     ReferenceTexture referenceTextures[NT_MAX_REFERENCE_TEXTURES];
     int numReferenceTextures = 0;
+    int usedOutputChannels = NT_OUTPUT_SIZE;
 
     float *inferenceOutput = nullptr;
     float *inferenceMseAccum = nullptr;

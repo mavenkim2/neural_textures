@@ -195,7 +195,8 @@ BackwardPass(const tcnn::hvec<NT_OUTPUT_SIZE> &lossGradientVector,
     SumRows<numThreads, NT_HIDDEN_LAYER_SIZE>(hiddenGradientMatrix, shmem, layer0BiasGradients);
 
     auto outputWeightGradientMatrix =
-        tcnn::outer_product(outputLayerInput, lossGradientMatrix); // 16x16
+        tcnn::outer_product(outputLayerInput, lossGradientMatrix)
+            .flip_layout(); // 16x16, stored to CM weight memory
 
     // Write to memory
     SumIntoLinearGlobalMemoryHierarchicalFloat<numThreads>(
@@ -207,7 +208,8 @@ BackwardPass(const tcnn::hvec<NT_OUTPUT_SIZE> &lossGradientVector,
 
     tcnn::mma_vec<16> networkInputMatrix(networkInput); // 32x12
     auto hiddenWeightGradientMatrix =
-        tcnn::outer_product(networkInputMatrix, hiddenGradientMatrix); // 12x16
+        tcnn::outer_product(networkInputMatrix, hiddenGradientMatrix)
+            .flip_layout(); // 12x16, stored to CM weight memory
     SumIntoLinearGlobalMemoryHierarchicalFloat<numThreads>(
         hiddenWeightGradientMatrix, shmem, layer0WeightGradients);
 

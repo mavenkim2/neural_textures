@@ -928,7 +928,9 @@ int main(int argc, char *argv[])
             uploadedTextures.push_back(UploadTexture(hostTexture));
         }
 
-        ZeroUnusedOutputChannels(params, GetPackedChannelCount(hostTextures));
+        const int packedChannelCount = GetPackedChannelCount(hostTextures);
+        params.usedOutputChannels = packedChannelCount;
+        ZeroUnusedOutputChannels(params, packedChannelCount);
         InitializeReferenceTextures(params, uploadedTextures);
         params.imageWidth =
             uploadedTextures.empty() ? params.imageWidth : uploadedTextures[0].width;
@@ -1069,9 +1071,9 @@ int main(int argc, char *argv[])
                 &hostMseAccum, params.inferenceMseAccum, sizeof(float), cudaMemcpyDeviceToHost),
             "cudaMemcpy(inferenceMseAccum)");
 
-        const int packedChannelCount = std::max(1, GetPackedChannelCount(hostTextures));
+        const int packedChannelCountForMse = std::max(1, GetPackedChannelCount(hostTextures));
         const double mse =
-            (double)hostMseAccum / ((double)inferenceSampleCount * (double)packedChannelCount);
+            (double)hostMseAccum / ((double)inferenceSampleCount * (double)packedChannelCountForMse);
         std::printf("Inference MSE: %.8f\n", mse);
 
         SaveInferencePngs(std::filesystem::current_path() / "inference_outputs",
