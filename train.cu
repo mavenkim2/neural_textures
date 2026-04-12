@@ -843,6 +843,11 @@ NT_DEVICE void TrainLoopPass(KernelParams params)
                                                            params.networkBiases[1],
                                                            &activatedHiddenLayer0);
 
+        tcnn::hvec<NT_INPUT_SIZE> inputsVector0(sampledFeatures);
+        tcnn::mma_vec<16> inputsMatrix0(inputsVector0);
+        ForwardPassGeneric<NT_INPUT_SIZE, NT_OUTPUT_SIZE>(
+            inputsMatrix0, params.networkWeights[0], params.networkBiases[1]);
+
         // Calculate MSE loss
         float mse = 0.f;
         tcnn::hvec<NT_OUTPUT_SIZE> lossGradient;

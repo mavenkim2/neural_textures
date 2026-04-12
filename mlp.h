@@ -9,6 +9,36 @@
 namespace neural_textures
 {
 
+enum class Activation
+{
+    None,
+    ReLU,
+};
+
+template <int inputSize, int outputSize, Activation activation = Activation::ReLU>
+NT_DEVICE inline tcnn::mma_vec<AlignUp(outputSize, 16)>
+ForwardPassGeneric(const tcnn::mma_vec<AlignUp(inputSize, 16)> &inputsMatrix,
+                   const half *weightsLayer,
+                   const half *biasesLayer)
+{
+    constexpr int weightsRows = AlignUp(inputSize, 16);
+    constexpr int weightsColumns = AlignUp(outputSize, 16);
+
+    using weightsMatrix = tcnn::mma_mat<weightsRows, weightsColumns, tcnn::CM>;
+
+    weightsMatrix weights = weightsMatrix::from_linear_memory(weightsLayer);
+    tcnn::hvec<outputSize> biasesVec(biasesLayer);
+    tcnn::mma_vec<weightsColumns> biases(biasesVec);
+
+    auto outputMatrix = madd(inputsMatrix, weights, biases);
+
+    if constexpr (activation == Activation::ReLU)
+    {
+        outputMatrix.activate(tcnn::Activation::ReLU);
+    }
+    return outputMatrix;
+}
+
 NT_DEVICE inline tcnn::hvec<NT_OUTPUT_SIZE>
 ForwardPass(const half *sampledFeatures,
             const half *weightsLayer0,
@@ -188,15 +218,14 @@ BackwardPass(const tcnn::hvec<NT_OUTPUT_SIZE> &lossGradientVector,
     SumRows<numThreads, NT_OUTPUT_SIZE>(lossGradientMatrix, shmem, layer1BiasGradients);
 
     tcnn::mma_mat<16, 16, tcnn::CM> weightsOutput =
-        tcnn::mma_mat<16, 16, tcnn::CM>::from_linear_memory(weightsHidden1);      // 16x16
-    auto hiddenGradientMatrix = lossGradientMatrix * weightsOutput.transpose();   // 32x16
+        tcnn::mma_mat<16, 16, tcnn::CM>::from_linear_memory(weightsHidden1);     // 16x16
+    auto hiddenGradientMatrix = lossGradientMatrix * weightsOutput.transpose();  // 32x16
     tcnn::mma_vec<NT_HIDDEN_LAYER_SIZE> outputLayerInput(activatedHiddenLayer0); // 32x16
     hiddenGradientMatrix.activate_bwd<tcnn::Activation::ReLU>(outputLayerInput);
     SumRows<numThreads, NT_HIDDEN_LAYER_SIZE>(hiddenGradientMatrix, shmem, layer0BiasGradients);
 
-    auto outputWeightGradientMatrix =
-        tcnn::outer_product(outputLayerInput, lossGradientMatrix)
-            .flip_layout(); // 16x16, stored to CM weight memory
+    auto outputWeightGradientMatrix = tcnn::outer_product(outputLayerInput, lossGradientMatrix)
+                                          .flip_layout(); // 16x16, stored to CM weight memory
 
     // Write to memory
     SumIntoLinearGlobalMemoryHierarchicalFloat<numThreads>(
@@ -207,9 +236,8 @@ BackwardPass(const tcnn::hvec<NT_OUTPUT_SIZE> &lossGradientVector,
     auto inputGradientMatrix = hiddenGradientMatrix * weightsHiddenLayer0.transpose(); // 32x12
 
     tcnn::mma_vec<16> networkInputMatrix(networkInput); // 32x12
-    auto hiddenWeightGradientMatrix =
-        tcnn::outer_product(networkInputMatrix, hiddenGradientMatrix)
-            .flip_layout(); // 12x16, stored to CM weight memory
+    auto hiddenWeightGradientMatrix = tcnn::outer_product(networkInputMatrix, hiddenGradientMatrix)
+                                          .flip_layout(); // 12x16, stored to CM weight memory
     SumIntoLinearGlobalMemoryHierarchicalFloat<numThreads>(
         hiddenWeightGradientMatrix, shmem, layer0WeightGradients);
 

@@ -4,6 +4,7 @@
 #include <cctype>
 #include <chrono>
 #include <cstdio>
+#include <cstring>
 #include <cstdlib>
 #include <filesystem>
 #include <random>
@@ -256,33 +257,6 @@ int GetPackedChannelCount(const std::vector<HostTexture> &textures)
     return channelCount;
 }
 
-void ZeroUnusedOutputChannels(KernelParams &params, int usedChannelCount)
-{
-    const int clampedUsedChannels = std::clamp(usedChannelCount, 0, NT_OUTPUT_SIZE);
-    if (clampedUsedChannels >= NT_OUTPUT_SIZE)
-    {
-        return;
-    }
-
-    constexpr int kOutputLayerIndex = 1;
-    constexpr size_t kPaddedRows = NT_HIDDEN_LAYER_SIZE;
-    constexpr size_t kBiasCount = NT_HIDDEN_LAYER_SIZE;
-
-    for (int outputChannel = clampedUsedChannels; outputChannel < NT_OUTPUT_SIZE; ++outputChannel)
-    {
-        half *weightColumnStart =
-            params.networkWeights[kOutputLayerIndex] + (size_t)outputChannel * kPaddedRows;
-        CheckCuda(cudaMemset(weightColumnStart, 0, kPaddedRows * sizeof(half)),
-                  "cudaMemset(unused output weights)");
-    }
-
-    half *biasStart = params.networkBiases[kOutputLayerIndex] + clampedUsedChannels;
-    CheckCuda(cudaMemset(biasStart,
-                         0,
-                         (kBiasCount - (size_t)clampedUsedChannels) * sizeof(half)),
-              "cudaMemset(unused output biases)");
-}
-
 uint8_t FloatToUnorm8(float value)
 {
     const float clamped = std::clamp(value, 0.f, 1.f);
@@ -292,6 +266,41 @@ uint8_t FloatToUnorm8(float value)
 bool ChannelLoadsAsUint(const EXRHeader &header, int channelIndex)
 {
     return header.requested_pixel_types[channelIndex] == TINYEXR_PIXELTYPE_UINT;
+}
+
+int GetExrChannelDestinationIndex(const char *channelName, int channelIndex, int numChannels)
+{
+    if (channelName && channelName[0] != '\0')
+    {
+        const char *componentName = std::strrchr(channelName, '.');
+        componentName = componentName ? componentName + 1 : channelName;
+
+        const char component = (char)std::toupper((unsigned char)componentName[0]);
+        switch (component)
+        {
+        case 'R': return 0;
+        case 'G': return 1;
+        case 'B': return 2;
+        case 'A': return 3;
+        default: break;
+        }
+    }
+
+    if (numChannels == 4)
+    {
+        // Common EXR channel order is A, B, G, R when iterating header channels directly.
+        static const int kDefaultAbgrToRgba[4] = {3, 2, 1, 0};
+        return kDefaultAbgrToRgba[channelIndex];
+    }
+
+    if (numChannels == 3)
+    {
+        // Common EXR channel order is B, G, R when iterating header channels directly.
+        static const int kDefaultBgrToRgb[3] = {2, 1, 0};
+        return kDefaultBgrToRgb[channelIndex];
+    }
+
+    return channelIndex;
 }
 
 void CopyExrPixelToMip(const EXRHeader &header,
@@ -316,14 +325,17 @@ void CopyExrPixelToMip(const EXRHeader &header,
 
     for (int channelIndex = 0; channelIndex < numChannels; ++channelIndex)
     {
+        const int destinationIndex =
+            GetExrChannelDestinationIndex(header.channels[channelIndex].name, channelIndex, numChannels);
+
         if (ChannelLoadsAsUint(header, channelIndex))
         {
-            destPixel[channelIndex] =
+            destPixel[destinationIndex] =
                 (float)reinterpret_cast<unsigned int **>(images)[channelIndex][sourceIndex];
         }
         else
         {
-            destPixel[channelIndex] =
+            destPixel[destinationIndex] =
                 reinterpret_cast<float **>(images)[channelIndex][sourceIndex];
         }
     }
@@ -709,17 +721,19 @@ void InitializeFeatureStorage(Feature &feature, const FeatureModeConfig &config,
                                                       "cudaMemcpy(feature.unconstrainedMoment2)");
 }
 
-void InitializeNetworkStorage(KernelParams &params, std::mt19937 &rng)
+void InitializeNetworkStorage(KernelParams &params, std::mt19937 &rng, int usedOutputChannels)
 {
     constexpr size_t paddedWeightCount = NT_HIDDEN_LAYER_SIZE * NT_HIDDEN_LAYER_SIZE;
     constexpr size_t biasCount = NT_HIDDEN_LAYER_SIZE;
+    const size_t clampedUsedOutputChannels =
+        (size_t)std::clamp(usedOutputChannels, 0, NT_OUTPUT_SIZE);
     const size_t activeWeightRows[NT_NUM_NETWORK_LAYERS] = {
         NT_INPUT_SIZE,
         NT_HIDDEN_LAYER_SIZE,
     };
     const size_t activeWeightCols[NT_NUM_NETWORK_LAYERS] = {
         NT_HIDDEN_LAYER_SIZE,
-        NT_OUTPUT_SIZE,
+        clampedUsedOutputChannels,
     };
 
     for (int layer = 0; layer < NT_NUM_NETWORK_LAYERS; ++layer)
@@ -769,7 +783,7 @@ void InitializeNetworkStorage(KernelParams &params, std::mt19937 &rng)
     }
 }
 
-void InitializeTrainingMode(KernelParams &params, int mode)
+void InitializeTrainingMode(KernelParams &params, int mode, int usedOutputChannels)
 {
     const TrainingModeConfig &config = gTrainingModeConfigs[mode];
     std::mt19937 rng(1337u + (uint32_t)mode);
@@ -783,6 +797,7 @@ void InitializeTrainingMode(KernelParams &params, int mode)
     params.networkAdam.beta1 = 0.9f;
     params.networkAdam.beta2 = 0.999f;
     params.networkAdam.epsilon = 1e-8f;
+    params.usedOutputChannels = std::clamp(usedOutputChannels, 0, NT_OUTPUT_SIZE);
 
     params.numMips = 0;
     for (int featureIndex = 0; featureIndex < NT_NUM_FEATURES; ++featureIndex)
@@ -792,7 +807,7 @@ void InitializeTrainingMode(KernelParams &params, int mode)
         params.numMips = std::max(params.numMips, params.features[featureIndex].numMips);
     }
 
-    InitializeNetworkStorage(params, rng);
+    InitializeNetworkStorage(params, rng, params.usedOutputChannels);
 
     params.imageWidth = config.features[0].resolution;
     params.imageHeight = config.features[0].resolution;
@@ -902,8 +917,6 @@ int main(int argc, char *argv[])
         std::vector<HostTexture> hostTextures;
         hostTextures.reserve(options.inputPaths.size());
 
-        InitializeTrainingMode(params, options.mode);
-
         for (const std::filesystem::path &path : options.inputPaths)
         {
             if (!std::filesystem::exists(path))
@@ -920,6 +933,9 @@ int main(int argc, char *argv[])
             hostTextures.push_back(LoadExrTexture(path));
         }
 
+        const int packedChannelCount = GetPackedChannelCount(hostTextures);
+        InitializeTrainingMode(params, options.mode, packedChannelCount);
+
         std::vector<UploadedTexture> uploadedTextures;
         uploadedTextures.reserve(hostTextures.size());
 
@@ -928,9 +944,6 @@ int main(int argc, char *argv[])
             uploadedTextures.push_back(UploadTexture(hostTexture));
         }
 
-        const int packedChannelCount = GetPackedChannelCount(hostTextures);
-        params.usedOutputChannels = packedChannelCount;
-        ZeroUnusedOutputChannels(params, packedChannelCount);
         InitializeReferenceTextures(params, uploadedTextures);
         params.imageWidth =
             uploadedTextures.empty() ? params.imageWidth : uploadedTextures[0].width;
@@ -984,8 +997,8 @@ int main(int argc, char *argv[])
 
 #if 1
         const int unconstrainedThreshold = 5000;
-        // const int blockFeaturesThreshold = unconstrainedThreshold + 200000;
-        const int blockFeaturesThreshold = unconstrainedThreshold + 5000;
+        const int blockFeaturesThreshold = unconstrainedThreshold + 200000;
+        // const int blockFeaturesThreshold = unconstrainedThreshold + 10000;
         const int maxIters = blockFeaturesThreshold + 1000;
         const int progressInterval = 1000;
         constexpr int kTrainingRegionSize = 512;
@@ -1072,8 +1085,8 @@ int main(int argc, char *argv[])
             "cudaMemcpy(inferenceMseAccum)");
 
         const int packedChannelCountForMse = std::max(1, GetPackedChannelCount(hostTextures));
-        const double mse =
-            (double)hostMseAccum / ((double)inferenceSampleCount * (double)packedChannelCountForMse);
+        const double mse = (double)hostMseAccum /
+                           ((double)inferenceSampleCount * (double)packedChannelCountForMse);
         std::printf("Inference MSE: %.8f\n", mse);
 
         SaveInferencePngs(std::filesystem::current_path() / "inference_outputs",
