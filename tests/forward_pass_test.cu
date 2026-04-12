@@ -22,8 +22,8 @@ __global__ static void ForwardPassTestKernel(half *outputs,
     const uint32_t lane = threadIdx.x & (WARP_SIZE - 1u);
     const half *laneInputs = inputs + lane * NT_INPUT_SIZE;
 
-    tcnn::hvec<NT_OUTPUT_SIZE> outputVec =
-        ForwardPass(laneInputs, weightsHidden0, weightsHidden1, biasesHidden0, biasesHidden1);
+    tcnn::hvec<NT_OUTPUT_SIZE> outputVec = ForwardPass12x16xOutput(
+        laneInputs, weightsHidden0, weightsHidden1, biasesHidden0, biasesHidden1);
 
     for (int i = 0; i < NT_OUTPUT_SIZE; i++)
     {

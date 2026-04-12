@@ -997,8 +997,8 @@ int main(int argc, char *argv[])
 
 #if 1
         const int unconstrainedThreshold = 5000;
-        const int blockFeaturesThreshold = unconstrainedThreshold + 200000;
-        // const int blockFeaturesThreshold = unconstrainedThreshold + 10000;
+        // const int blockFeaturesThreshold = unconstrainedThreshold + 200000;
+        const int blockFeaturesThreshold = unconstrainedThreshold + 10000;
         const int maxIters = blockFeaturesThreshold + 1000;
         const int progressInterval = 1000;
         constexpr int kTrainingRegionSize = 512;

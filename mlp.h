@@ -9,13 +9,13 @@
 namespace neural_textures
 {
 
-enum class Activation
+enum class LayerActivation
 {
     None,
     ReLU,
 };
 
-template <int inputSize, int outputSize, Activation activation = Activation::ReLU>
+template <int inputSize, int outputSize, LayerActivation activation = LayerActivation::ReLU>
 NT_DEVICE inline tcnn::mma_vec<AlignUp(outputSize, 16)>
 ForwardPassGeneric(const tcnn::mma_vec<AlignUp(inputSize, 16)> &inputsMatrix,
                    const half *weightsLayer,
@@ -32,45 +32,33 @@ ForwardPassGeneric(const tcnn::mma_vec<AlignUp(inputSize, 16)> &inputsMatrix,
 
     auto outputMatrix = madd(inputsMatrix, weights, biases);
 
-    if constexpr (activation == Activation::ReLU)
+    if constexpr (activation == LayerActivation::ReLU)
     {
-        outputMatrix.activate(tcnn::Activation::ReLU);
+        outputMatrix.template activate<tcnn::Activation::ReLU>();
     }
     return outputMatrix;
 }
 
 NT_DEVICE inline tcnn::hvec<NT_OUTPUT_SIZE>
-ForwardPass(const half *sampledFeatures,
-            const half *weightsLayer0,
-            const half *weightsLayer1,
-            const half *biasesLayer0,
-            const half *biasesLayer1,
-            tcnn::hvec<NT_HIDDEN_LAYER_SIZE> *activatedHiddenLayer0 = 0)
+ForwardPass12x16xOutput(const half *sampledFeatures,
+                        const half *weightsLayer0,
+                        const half *weightsLayer1,
+                        const half *biasesLayer0,
+                        const half *biasesLayer1,
+                        tcnn::hvec<NT_HIDDEN_LAYER_SIZE> *activatedHiddenLayer0 = 0)
 {
-    tcnn::hvec<NT_INPUT_SIZE> inputsVector0(sampledFeatures);
-    tcnn::mma_vec<16> inputsMatrix0(inputsVector0);
-
-    tcnn::mma_mat<16, 16, tcnn::CM> weightsHiddenLayer0 =
-        tcnn::mma_mat<16, 16, tcnn::CM>::from_linear_memory(weightsLayer0);
-    tcnn::hvec<NT_HIDDEN_LAYER_SIZE> vecBiasesLayer0(biasesLayer0);
-    tcnn::mma_vec<NT_HIDDEN_LAYER_SIZE> matBiasesLayer0(vecBiasesLayer0);
-
-    auto outputHiddenLayer0 = madd(inputsMatrix0, weightsHiddenLayer0, matBiasesLayer0);
-    outputHiddenLayer0.activate<tcnn::Activation::ReLU>();
+    tcnn::hvec<NT_INPUT_SIZE> inputsVector(sampledFeatures);
+    tcnn::mma_vec<16> inputsMatrix(inputsVector);
+    auto outputHiddenLayer = ForwardPassGeneric<NT_INPUT_SIZE, NT_HIDDEN_LAYER_SIZE>(
+        inputsMatrix, weightsLayer0, biasesLayer0);
 
     if (activatedHiddenLayer0)
     {
-        *activatedHiddenLayer0 = outputHiddenLayer0.vec<NT_HIDDEN_LAYER_SIZE>();
+        *activatedHiddenLayer0 = outputHiddenLayer.vec<NT_HIDDEN_LAYER_SIZE>();
     }
-
-    tcnn::mma_mat<16, 16, tcnn::CM> weightsHiddenLayer1 =
-        tcnn::mma_mat<16, 16, tcnn::CM>::from_linear_memory(weightsLayer1);
-    tcnn::hvec<NT_HIDDEN_LAYER_SIZE> vecBiasesLayer1(biasesLayer1);
-    tcnn::mma_vec<NT_HIDDEN_LAYER_SIZE> matBiasesLayer1(vecBiasesLayer1);
-
-    auto finalOutput = madd(outputHiddenLayer0, weightsHiddenLayer1, matBiasesLayer1);
-    // finalOutput.activate<tcnn::Activation::ReLU>();
-
+    auto finalOutput =
+        ForwardPassGeneric<NT_HIDDEN_LAYER_SIZE, NT_OUTPUT_SIZE, LayerActivation::None>(
+            outputHiddenLayer, weightsLayer1, biasesLayer1);
     return finalOutput.vec<NT_OUTPUT_SIZE>();
 }
 
