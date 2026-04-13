@@ -63,16 +63,17 @@ ForwardPass12x16xOutput(const half *sampledFeatures,
 }
 
 template <uint32_t N_THREADS, uint32_t N>
-__device__ void SumRows(tcnn::mma_vec<16> &gradMat,
+__device__ void SumRows(tcnn::mma_vec<AlignUp(N, 16)> &gradMat,
                         float *sharedPartials, // size: (N_THREADS / 32) * 16
                         float *globalBiasGrad  // size: 16
 )
 {
     constexpr uint32_t numWarps = N_THREADS / 32;
+    constexpr uint32_t alignedSize = AlignUp(N, 16);
     const uint32_t lane = threadIdx.x & 31;
     const uint32_t warp = threadIdx.x >> 5;
 
-    tcnn::hvec<16> row = gradMat.vec<16>();
+    tcnn::hvec<alignedSize> row = gradMat.template vec<alignedSize>();
 
     float accum[N];
 #pragma unroll
@@ -182,17 +183,54 @@ NT_DEVICE inline void SumIntoLinearGlobalMemoryHierarchicalFloat(
     }
 }
 
+template <uint32_t numThreads,
+          uint32_t inputSize,
+          uint32_t outputSize,
+          LayerActivation activation = LayerActivation::ReLU>
+NT_DEVICE inline tcnn::mma_vec<AlignUp(inputSize, 16)>
+BackwardGenericPass(tcnn::mma_vec<AlignUp(outputSize, 16)> &outputGradientMatrix,
+                    const tcnn::hvec<inputSize> &layerInput,
+                    const half *weights,
+                    float *layerWeightGradients,
+                    float *layerBiasGradients,
+                    float *shmem)
+{
+    constexpr int weightsRows = AlignUp(inputSize, 16);
+    constexpr int weightsColumns = AlignUp(outputSize, 16);
+    using weightsMatrix = tcnn::mma_mat<weightsRows, weightsColumns, tcnn::CM>;
+
+    SumRows<numThreads, outputSize>(outputGradientMatrix, shmem, layerBiasGradients);
+
+    weightsMatrix weightsOutput = weightsMatrix::from_linear_memory(weights);
+    auto inputGradientMatrix = outputGradientMatrix * weightsOutput.transpose();
+
+    tcnn::mma_vec<weightsRows> layerMatrixInput(layerInput);
+    if constexpr (activation == LayerActivation::ReLU)
+    {
+        inputGradientMatrix.activate_bwd<tcnn::Activation::ReLU>(layerMatrixInput);
+    }
+
+    auto outputWeightGradientMatrix =
+        tcnn::outer_product(layerMatrixInput, outputGradientMatrix).flip_layout();
+
+    // Write to memory
+    SumIntoLinearGlobalMemoryHierarchicalFloat<numThreads>(
+        outputWeightGradientMatrix, shmem, layerWeightGradients);
+
+    return inputGradientMatrix;
+}
+
 template <uint32_t numThreads>
 NT_DEVICE inline tcnn::hvec<NT_INPUT_SIZE>
-BackwardPass(const tcnn::hvec<NT_OUTPUT_SIZE> &lossGradientVector,
-             const tcnn::hvec<NT_HIDDEN_LAYER_SIZE> &activatedHiddenLayer0,
-             const tcnn::hvec<NT_INPUT_SIZE> &networkInput,
-             const half *weightsHidden0,
-             const half *weightsHidden1,
-             float *layer0WeightGradients,
-             float *layer1WeightGradients,
-             float *layer0BiasGradients,
-             float *layer1BiasGradients)
+BackwardPass12x16xOutput(const tcnn::hvec<NT_OUTPUT_SIZE> &lossGradientVector,
+                         const tcnn::hvec<NT_HIDDEN_LAYER_SIZE> &activatedHiddenLayer0,
+                         const tcnn::hvec<NT_INPUT_SIZE> &networkInput,
+                         const half *weightsHidden0,
+                         const half *weightsHidden1,
+                         float *layer0WeightGradients,
+                         float *layer1WeightGradients,
+                         float *layer0BiasGradients,
+                         float *layer1BiasGradients)
 {
     constexpr uint32_t numWarps = numThreads / 32;
     constexpr uint32_t maxBiasSharedFloats = numWarps * NT_HIDDEN_LAYER_SIZE;
@@ -202,33 +240,26 @@ BackwardPass(const tcnn::hvec<NT_OUTPUT_SIZE> &lossGradientVector,
         maxBiasSharedFloats > maxWeightSharedFloats ? maxBiasSharedFloats : maxWeightSharedFloats;
     __shared__ float shmem[shmemFloats > 0 ? shmemFloats : 1];
 
-    tcnn::mma_vec<16> lossGradientMatrix(lossGradientVector); // 32xNT_OUTPUT_SIZE
-    SumRows<numThreads, NT_OUTPUT_SIZE>(lossGradientMatrix, shmem, layer1BiasGradients);
+    tcnn::mma_vec<NT_OUTPUT_SIZE> outputGradientMatrix(lossGradientVector);
+    tcnn::mma_vec<NT_HIDDEN_LAYER_SIZE> hiddenGradientMatrix =
+        BackwardGenericPass<numThreads, NT_HIDDEN_LAYER_SIZE, NT_OUTPUT_SIZE>(
+            outputGradientMatrix,
+            activatedHiddenLayer0,
+            weightsHidden1,
+            layer1WeightGradients,
+            layer1BiasGradients,
+            shmem);
 
-    tcnn::mma_mat<16, 16, tcnn::CM> weightsOutput =
-        tcnn::mma_mat<16, 16, tcnn::CM>::from_linear_memory(weightsHidden1);     // 16x16
-    auto hiddenGradientMatrix = lossGradientMatrix * weightsOutput.transpose();  // 32x16
-    tcnn::mma_vec<NT_HIDDEN_LAYER_SIZE> outputLayerInput(activatedHiddenLayer0); // 32x16
-    hiddenGradientMatrix.activate_bwd<tcnn::Activation::ReLU>(outputLayerInput);
-    SumRows<numThreads, NT_HIDDEN_LAYER_SIZE>(hiddenGradientMatrix, shmem, layer0BiasGradients);
-
-    auto outputWeightGradientMatrix = tcnn::outer_product(outputLayerInput, lossGradientMatrix)
-                                          .flip_layout(); // 16x16, stored to CM weight memory
-
-    // Write to memory
-    SumIntoLinearGlobalMemoryHierarchicalFloat<numThreads>(
-        outputWeightGradientMatrix, shmem, layer1WeightGradients);
-
-    tcnn::mma_mat<16, 16, tcnn::CM> weightsHiddenLayer0 =
-        tcnn::mma_mat<16, 16, tcnn::CM>::from_linear_memory(weightsHidden0);           // 12x16
-    auto inputGradientMatrix = hiddenGradientMatrix * weightsHiddenLayer0.transpose(); // 32x12
-
-    tcnn::mma_vec<16> networkInputMatrix(networkInput); // 32x12
-    auto hiddenWeightGradientMatrix = tcnn::outer_product(networkInputMatrix, hiddenGradientMatrix)
-                                          .flip_layout(); // 12x16, stored to CM weight memory
-    SumIntoLinearGlobalMemoryHierarchicalFloat<numThreads>(
-        hiddenWeightGradientMatrix, shmem, layer0WeightGradients);
-
+    tcnn::mma_vec<NT_HIDDEN_LAYER_SIZE> inputGradientMatrix =
+        BackwardGenericPass<numThreads,
+                            NT_INPUT_SIZE,
+                            NT_HIDDEN_LAYER_SIZE,
+                            LayerActivation::None>(hiddenGradientMatrix,
+                                                   networkInput,
+                                                   weightsHidden0,
+                                                   layer0WeightGradients,
+                                                   layer0BiasGradients,
+                                                   shmem);
     return inputGradientMatrix.vec<NT_INPUT_SIZE>();
 }
 

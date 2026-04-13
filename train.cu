@@ -858,15 +858,15 @@ NT_DEVICE void TrainLoopPass(KernelParams params)
 
         tcnn::hvec<NT_INPUT_SIZE> inputsVector(sampledFeatures);
         tcnn::hvec<NT_INPUT_SIZE> inputGradient =
-            BackwardPass<numThreads>(lossGradient,
-                                     activatedHiddenLayer0,
-                                     inputsVector,
-                                     params.networkWeights[0],
-                                     params.networkWeights[1],
-                                     params.networkWeightGradients[0],
-                                     params.networkWeightGradients[1],
-                                     params.networkBiasGradients[0],
-                                     params.networkBiasGradients[1]);
+            BackwardPass12x16xOutput<numThreads>(lossGradient,
+                                                 activatedHiddenLayer0,
+                                                 inputsVector,
+                                                 params.networkWeights[0],
+                                                 params.networkWeights[1],
+                                                 params.networkWeightGradients[0],
+                                                 params.networkWeightGradients[1],
+                                                 params.networkBiasGradients[0],
+                                                 params.networkBiasGradients[1]);
 
         if constexpr (type == TrainingKernelType::UNCONSTRAINED)
         {
