@@ -103,11 +103,18 @@ NT_DEVICE inline T SampleReferenceTextureTrilinear(const ReferenceTexture &textu
 }
 
 NT_DEVICE inline void
-InitializeExpectedValues(const KernelParams &params, const float3 &uvs, float *expected)
+InitializeExpectedValues(const KernelParams &params,
+                         const float3 &uvs,
+                         float *expected,
+                         float *channelWeights = nullptr)
 {
     for (int i = 0; i < NT_OUTPUT_SIZE; ++i)
     {
         expected[i] = 0.f;
+        if (channelWeights)
+        {
+            channelWeights[i] = 1.f;
+        }
     }
 
     int outputChannel = 0;
@@ -127,6 +134,10 @@ InitializeExpectedValues(const KernelParams &params, const float3 &uvs, float *e
         if (texture.numChannels == 1)
         {
             expected[outputChannel++] = SampleReferenceTextureTrilinear<float>(texture, uvs);
+            if (channelWeights)
+            {
+                channelWeights[outputChannel - 1] = texture.lossWeight;
+            }
             continue;
         }
 
@@ -137,6 +148,10 @@ InitializeExpectedValues(const KernelParams &params, const float3 &uvs, float *e
              ++channelIndex)
         {
             expected[outputChannel++] = channels[channelIndex];
+            if (channelWeights)
+            {
+                channelWeights[outputChannel - 1] = texture.lossWeight;
+            }
         }
     }
 }
@@ -665,29 +680,38 @@ NT_DEVICE inline void OptimizeFeatureBlock(BC6Parameters &parameters,
 
 NT_DEVICE inline void OptimizeNetworkPass(KernelParams params)
 {
-    constexpr int paddedWeightRows = NT_HIDDEN_LAYER_SIZE;
     constexpr int weightRows[NT_NUM_NETWORK_LAYERS] = {
         NT_INPUT_SIZE,
-        NT_HIDDEN_LAYER_SIZE,
+        NT_MLP_HIDDEN_LAYER0_SIZE,
+        NT_MLP_HIDDEN_LAYER1_SIZE,
     };
     constexpr int weightCols[NT_NUM_NETWORK_LAYERS] = {
-        NT_HIDDEN_LAYER_SIZE,
+        NT_MLP_HIDDEN_LAYER0_SIZE,
+        NT_MLP_HIDDEN_LAYER1_SIZE,
         NT_OUTPUT_SIZE,
     };
+    constexpr int paddedWeightRows[NT_NUM_NETWORK_LAYERS] = {
+        AlignUp(NT_INPUT_SIZE, 16),
+        AlignUp(NT_MLP_HIDDEN_LAYER0_SIZE, 16),
+        AlignUp(NT_MLP_HIDDEN_LAYER1_SIZE, 16),
+    };
     constexpr int biasCounts[NT_NUM_NETWORK_LAYERS] = {
-        NT_HIDDEN_LAYER_SIZE,
+        NT_MLP_HIDDEN_LAYER0_SIZE,
+        NT_MLP_HIDDEN_LAYER1_SIZE,
         NT_OUTPUT_SIZE,
     };
 
     for (int layer = 0; layer < NT_NUM_NETWORK_LAYERS; ++layer)
     {
+        const int activeCols =
+            layer == (NT_NUM_NETWORK_LAYERS - 1) ? params.usedOutputChannels : weightCols[layer];
         OptimizePaddedParameterMatrix(params.networkWeights[layer],
                                       params.networkWeightGradients[layer],
                                       params.networkWeightMoment1[layer],
                                       params.networkWeightMoment2[layer],
                                       weightRows[layer],
-                                      weightCols[layer],
-                                      paddedWeightRows,
+                                      activeCols,
+                                      paddedWeightRows[layer],
                                       params.networkAdam,
                                       params.step);
 
@@ -833,15 +857,21 @@ NT_DEVICE void TrainLoopPass(KernelParams params)
         // filtered reference material sample, and backpropagate into network + BC6 params.
 
         float expected[NT_OUTPUT_SIZE] = {};
-        InitializeExpectedValues(params, uvs, expected);
+        float channelWeights[NT_OUTPUT_SIZE] = {};
+        InitializeExpectedValues(params, uvs, expected, channelWeights);
 
-        tcnn::hvec<NT_HIDDEN_LAYER_SIZE> activatedHiddenLayer0;
-        tcnn::hvec<NT_OUTPUT_SIZE> outputVec = ForwardPass12x16xOutput(sampledFeatures,
-                                                                       params.networkWeights[0],
-                                                                       params.networkWeights[1],
-                                                                       params.networkBiases[0],
-                                                                       params.networkBiases[1],
-                                                                       &activatedHiddenLayer0);
+        tcnn::hvec<NT_MLP_HIDDEN_LAYER0_SIZE> activatedHiddenLayer0;
+        tcnn::hvec<NT_MLP_HIDDEN_LAYER1_SIZE> activatedHiddenLayer1;
+        tcnn::hvec<NT_OUTPUT_SIZE> outputVec =
+            ForwardPass12x32x32x16Output(sampledFeatures,
+                                         params.networkWeights[0],
+                                         params.networkWeights[1],
+                                         params.networkWeights[2],
+                                         params.networkBiases[0],
+                                         params.networkBiases[1],
+                                         params.networkBiases[2],
+                                         &activatedHiddenLayer0,
+                                         &activatedHiddenLayer1);
 
         // Calculate MSE loss
         float mse = 0.f;
@@ -850,23 +880,28 @@ NT_DEVICE void TrainLoopPass(KernelParams params)
         {
             float outputValue = __half2float(outputVec[i]);
             float error = outputValue - expected[i];
-            mse += error * error;
+            const float channelWeight = channelWeights[i];
+            mse += channelWeight * error * error;
 
-            float loss = 2.f * error / float(params.numSamples);
+            float loss = 2.f * channelWeight * error / float(params.numSamples);
             lossGradient[i] = __float2half(loss);
         }
 
         tcnn::hvec<NT_INPUT_SIZE> inputsVector(sampledFeatures);
         tcnn::hvec<NT_INPUT_SIZE> inputGradient =
-            BackwardPass12x16xOutput<numThreads>(lossGradient,
-                                                 activatedHiddenLayer0,
-                                                 inputsVector,
-                                                 params.networkWeights[0],
-                                                 params.networkWeights[1],
-                                                 params.networkWeightGradients[0],
-                                                 params.networkWeightGradients[1],
-                                                 params.networkBiasGradients[0],
-                                                 params.networkBiasGradients[1]);
+            BackwardPass12x32x32x16Output<numThreads>(lossGradient,
+                                                      activatedHiddenLayer0,
+                                                      activatedHiddenLayer1,
+                                                      inputsVector,
+                                                      params.networkWeights[0],
+                                                      params.networkWeights[1],
+                                                      params.networkWeights[2],
+                                                      params.networkWeightGradients[0],
+                                                      params.networkWeightGradients[1],
+                                                      params.networkWeightGradients[2],
+                                                      params.networkBiasGradients[0],
+                                                      params.networkBiasGradients[1],
+                                                      params.networkBiasGradients[2]);
 
         if constexpr (type == TrainingKernelType::UNCONSTRAINED)
         {
@@ -903,11 +938,13 @@ NT_DEVICE void Inference(KernelParams params)
     float expected[NT_OUTPUT_SIZE] = {};
     InitializeExpectedValues(params, uvs, expected);
 
-    tcnn::hvec<NT_OUTPUT_SIZE> outputVec = ForwardPass12x16xOutput(sampledFeatures,
-                                                                   params.networkWeights[0],
-                                                                   params.networkWeights[1],
-                                                                   params.networkBiases[0],
-                                                                   params.networkBiases[1]);
+    tcnn::hvec<NT_OUTPUT_SIZE> outputVec = ForwardPass12x32x32x16Output(sampledFeatures,
+                                                                        params.networkWeights[0],
+                                                                        params.networkWeights[1],
+                                                                        params.networkWeights[2],
+                                                                        params.networkBiases[0],
+                                                                        params.networkBiases[1],
+                                                                        params.networkBiases[2]);
 
     float sampleSse = 0.f;
     const uint32_t outputBaseIndex = sampleIndex * NT_OUTPUT_SIZE;

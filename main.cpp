@@ -257,6 +257,17 @@ int GetPackedChannelCount(const std::vector<HostTexture> &textures)
     return channelCount;
 }
 
+float GetReferenceTextureLossWeight(const HostTexture &texture)
+{
+    const std::string stemLower = ToLower(texture.path.stem().string());
+    if (stemLower.find("surfacecolor") != std::string::npos)
+    {
+        return 4.0f;
+    }
+
+    return 1.0f;
+}
+
 uint8_t FloatToUnorm8(float value)
 {
     const float clamped = std::clamp(value, 0.f, 1.f);
@@ -723,21 +734,18 @@ void InitializeFeatureStorage(Feature &feature, const FeatureModeConfig &config,
 
 void InitializeNetworkStorage(KernelParams &params, std::mt19937 &rng, int usedOutputChannels)
 {
-    constexpr size_t paddedWeightCount = NT_HIDDEN_LAYER_SIZE * NT_HIDDEN_LAYER_SIZE;
-    constexpr size_t biasCount = NT_HIDDEN_LAYER_SIZE;
     const size_t clampedUsedOutputChannels =
         (size_t)std::clamp(usedOutputChannels, 0, NT_OUTPUT_SIZE);
-    const size_t activeWeightRows[NT_NUM_NETWORK_LAYERS] = {
-        NT_INPUT_SIZE,
-        NT_HIDDEN_LAYER_SIZE,
-    };
-    const size_t activeWeightCols[NT_NUM_NETWORK_LAYERS] = {
-        NT_HIDDEN_LAYER_SIZE,
-        clampedUsedOutputChannels,
-    };
 
     for (int layer = 0; layer < NT_NUM_NETWORK_LAYERS; ++layer)
     {
+        const size_t paddedWeightCount = (size_t)kNetworkLayerWeightCounts[layer];
+        const size_t biasCount = (size_t)kNetworkLayerBiasCounts[layer];
+        const size_t activeWeightRows = (size_t)kNetworkLayerInputSizes[layer];
+        const size_t activeWeightCols = layer == (NT_NUM_NETWORK_LAYERS - 1)
+                                            ? clampedUsedOutputChannels
+                                            : (size_t)kNetworkLayerOutputSizes[layer];
+
         params.networkWeights[layer] =
             AllocateDeviceBuffer<half>(paddedWeightCount, "cudaMalloc(networkWeights)");
         params.networkWeightGradients[layer] =
@@ -747,10 +755,11 @@ void InitializeNetworkStorage(KernelParams &params, std::mt19937 &rng, int usedO
         params.networkWeightMoment2[layer] =
             AllocateDeviceBuffer<float>(paddedWeightCount, "cudaMalloc(networkWeightMoment2)");
 
-        std::vector<half> weights = InitializeNetworkWeightMatrix(NT_HIDDEN_LAYER_SIZE,
-                                                                  NT_HIDDEN_LAYER_SIZE,
-                                                                  activeWeightRows[layer],
-                                                                  activeWeightCols[layer],
+        std::vector<half> weights = InitializeNetworkWeightMatrix(
+                                                                  (size_t)kNetworkLayerPaddedInputSizes[layer],
+                                                                  (size_t)kNetworkLayerPaddedOutputSizes[layer],
+                                                                  activeWeightRows,
+                                                                  activeWeightCols,
                                                                   rng,
                                                                   1e-2f);
         UploadHostVector(params.networkWeights[layer], weights, "cudaMemcpy(networkWeights)");
@@ -817,6 +826,7 @@ void InitializeTrainingMode(KernelParams &params, int mode, int usedOutputChanne
 }
 
 void InitializeReferenceTextures(neural_textures::KernelParams &params,
+                                 const std::vector<HostTexture> &hostTextures,
                                  const std::vector<UploadedTexture> &uploadedTextures)
 {
     if (uploadedTextures.size() > NT_MAX_REFERENCE_TEXTURES)
@@ -829,6 +839,7 @@ void InitializeReferenceTextures(neural_textures::KernelParams &params,
 
     for (int textureIndex = 0; textureIndex < params.numReferenceTextures; ++textureIndex)
     {
+        const HostTexture &hostTexture = hostTextures[(size_t)textureIndex];
         const UploadedTexture &uploadedTexture = uploadedTextures[(size_t)textureIndex];
         neural_textures::ReferenceTexture &referenceTexture =
             params.referenceTextures[textureIndex];
@@ -837,6 +848,7 @@ void InitializeReferenceTextures(neural_textures::KernelParams &params,
         referenceTexture.height = uploadedTexture.height;
         referenceTexture.numChannels = uploadedTexture.numChannels;
         referenceTexture.numMipLevels = uploadedTexture.numMipLevels;
+        referenceTexture.lossWeight = GetReferenceTextureLossWeight(hostTexture);
     }
 }
 
@@ -944,7 +956,7 @@ int main(int argc, char *argv[])
             uploadedTextures.push_back(UploadTexture(hostTexture));
         }
 
-        InitializeReferenceTextures(params, uploadedTextures);
+        InitializeReferenceTextures(params, hostTextures, uploadedTextures);
         params.imageWidth =
             uploadedTextures.empty() ? params.imageWidth : uploadedTextures[0].width;
         params.imageHeight =
@@ -987,6 +999,13 @@ int main(int argc, char *argv[])
                 texture.cudaChannels,
                 texture.numMipLevels,
                 (unsigned long long)texture.texture);
+        }
+
+        for (int textureIndex = 0; textureIndex < params.numReferenceTextures; ++textureIndex)
+        {
+            std::printf("  loss weight %s = %.2f\n",
+                        hostTextures[(size_t)textureIndex].path.stem().string().c_str(),
+                        params.referenceTextures[textureIndex].lossWeight);
         }
 
         const size_t inferenceSampleCount = (size_t)params.imageWidth * (size_t)params.imageHeight;

@@ -9,10 +9,12 @@ namespace neural_textures
 #define NT_INPUT_SIZE 12
 #define NT_HIDDEN_LAYER_SIZE 16
 #define NT_OUTPUT_SIZE 16
+#define NT_MLP_HIDDEN_LAYER0_SIZE 32
+#define NT_MLP_HIDDEN_LAYER1_SIZE 32
 
 #define half __half
 
-#define NT_NUM_NETWORK_LAYERS 2
+#define NT_NUM_NETWORK_LAYERS 3
 #define NT_NUM_BC6_PIXELS_PER_BLOCK 16
 #define NT_NUM_FEATURES 4
 #define NT_MAX_REFERENCE_TEXTURES 16
@@ -71,6 +73,48 @@ struct ReferenceTexture
     int height = 0;
     int numChannels = 0;
     int numMipLevels = 0;
+    float lossWeight = 1.0f;
+};
+
+constexpr int AlignUpConstexpr(int value, int alignment)
+{
+    return ((value + alignment - 1) / alignment) * alignment;
+}
+
+static constexpr int kNetworkLayerInputSizes[NT_NUM_NETWORK_LAYERS] = {
+    NT_INPUT_SIZE,
+    NT_MLP_HIDDEN_LAYER0_SIZE,
+    NT_MLP_HIDDEN_LAYER1_SIZE,
+};
+
+static constexpr int kNetworkLayerOutputSizes[NT_NUM_NETWORK_LAYERS] = {
+    NT_MLP_HIDDEN_LAYER0_SIZE,
+    NT_MLP_HIDDEN_LAYER1_SIZE,
+    NT_OUTPUT_SIZE,
+};
+
+static constexpr int kNetworkLayerPaddedInputSizes[NT_NUM_NETWORK_LAYERS] = {
+    AlignUpConstexpr(kNetworkLayerInputSizes[0], 16),
+    AlignUpConstexpr(kNetworkLayerInputSizes[1], 16),
+    AlignUpConstexpr(kNetworkLayerInputSizes[2], 16),
+};
+
+static constexpr int kNetworkLayerPaddedOutputSizes[NT_NUM_NETWORK_LAYERS] = {
+    AlignUpConstexpr(kNetworkLayerOutputSizes[0], 16),
+    AlignUpConstexpr(kNetworkLayerOutputSizes[1], 16),
+    AlignUpConstexpr(kNetworkLayerOutputSizes[2], 16),
+};
+
+static constexpr int kNetworkLayerWeightCounts[NT_NUM_NETWORK_LAYERS] = {
+    kNetworkLayerPaddedInputSizes[0] * kNetworkLayerPaddedOutputSizes[0],
+    kNetworkLayerPaddedInputSizes[1] * kNetworkLayerPaddedOutputSizes[1],
+    kNetworkLayerPaddedInputSizes[2] * kNetworkLayerPaddedOutputSizes[2],
+};
+
+static constexpr int kNetworkLayerBiasCounts[NT_NUM_NETWORK_LAYERS] = {
+    kNetworkLayerOutputSizes[0],
+    kNetworkLayerOutputSizes[1],
+    kNetworkLayerOutputSizes[2],
 };
 
 struct KernelParams
