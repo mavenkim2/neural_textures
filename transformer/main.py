@@ -4,6 +4,7 @@ import exr
 import argparse
 import os
 import sys
+import utils
 
 
 class HalfTanh(nn.Module):
@@ -389,12 +390,9 @@ def train_network(image: torch.Tensor):
             batch_tensor = image.new_empty(
                 (batch_size, channels, max_crop_dim, max_crop_dim)
             )
-        for batch_index in range(batch_size):
-            start_u = torch.randint(0, width - crop_dim + 1)
-            start_v = torch.randint(0, height - crop_dim + 1)
-            batch_tensor[batch_index].copy_(
-                image[:, start_v : start_v + crop_dim, start_u : start_u + crop_dim]
-            )
+
+        utils.random_crops_into(batch_tensor, image, crop_dim)
+
         # See section 4 of paper
         encoded_tensor = network.global_transformation(batch_tensor)
         assert encoded_tensor.shape == [

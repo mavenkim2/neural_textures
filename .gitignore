@@ -42,3 +42,5 @@
 
 # more
 build/
+*.exr
+*__pycache__*
