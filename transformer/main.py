@@ -1,6 +1,9 @@
 import torch
 import torch.nn as nn
-import random
+import exr
+import argparse
+import os
+import sys
 
 
 class HalfTanh(nn.Module):
@@ -78,7 +81,12 @@ class LinearResidualBlock(nn.Module):
 
 class CompressionNetwork(nn.Module):
     def __init__(
-        self, input_channels, channels_n=192, channels_m=320, grid_channels=32, num_frequencies=6,
+        self,
+        input_channels,
+        channels_n=192,
+        channels_m=320,
+        grid_channels=32,
+        num_frequencies=6,
     ):
         super().__init__()
         self.grid_channels = grid_channels
@@ -129,7 +137,9 @@ class CompressionNetwork(nn.Module):
             stride=1,
         )
 
-        texture_synthesis_num_input_features = 5 * grid_channels + num_frequencies * 4 + 1
+        texture_synthesis_num_input_features = (
+            5 * grid_channels + num_frequencies * 4 + 1
+        )
         linear_residual_block_num_channels = 32
         self.texture_synthesizer = nn.Sequential(
             nn.Conv2d(
@@ -301,27 +311,47 @@ class CompressionNetwork(nn.Module):
 
         return y0, y1
 
-    def texture_synthesis_step(self, y0: torch.Tensor, y1: torch.Tensor, coords, crop_dim, mip):
+    def texture_synthesis_step(
+        self, y0: torch.Tensor, y1: torch.Tensor, coords, crop_dim, mip
+    ):
         # y0: [B, 4 * cg0, H, W]
         # y1: [B, cg1, H, W]
         # coords: [B, H, W, 2]
 
-        assert y0.shape[0] == y1.shape[1] and y0.shape[2:] == y1.shape[2:] == (crop_dim, crop_dim)
+        assert y0.shape[0] == y1.shape[1] and y0.shape[2:] == y1.shape[2:] == (
+            crop_dim,
+            crop_dim,
+        )
         batch_size = y0.shape[0]
         max_mip = int.bit_length(crop_dim) - 1
-        pow2s = 2.0 ** torch.arange(self.num_frequencies, device=y0.device, dtype = y0.dtype) # [F], F=num_frequencies
+        pow2s = 2.0 ** torch.arange(
+            self.num_frequencies, device=y0.device, dtype=y0.dtype
+        )  # [F], F=num_frequencies
 
-        vals = pow2s[:, None] * coords[..., None, :] * torch.pi # [F, 1] * [B, H, W, 1, 2] = [B, H, W, F, 2]
+        vals = (
+            pow2s[:, None] * coords[..., None, :] * torch.pi
+        )  # [F, 1] * [B, H, W, 1, 2] = [B, H, W, F, 2]
 
-        positional_encoding = torch.cat((torch.sin(vals), torch.cos(vals)), dim =-1) # [B, H, W, F, 4]
-        positional_encoding = positional_encoding.flatten(-2) # [B, H, W, 4 * F]
-        positional_encoding = positional_encoding.permute(0, 3, 1, 2) # [B, 4 * F, H, W]
+        positional_encoding = torch.cat(
+            (torch.sin(vals), torch.cos(vals)), dim=-1
+        )  # [B, H, W, F, 4]
+        positional_encoding = positional_encoding.flatten(-2)  # [B, H, W, 4 * F]
+        positional_encoding = positional_encoding.permute(
+            0, 3, 1, 2
+        )  # [B, 4 * F, H, W]
 
         mip_tensor = y0.new_full((batch_size, 1, crop_dim, crop_dim), mip / max_mip)
 
-        d_theta = torch.cat([y0, y1, mip_tensor, positional_encoding], dim=1) # [B, 4 * cg0 + cg1 + 1 + 4 * F, H, W]
+        d_theta = torch.cat(
+            [y0, y1, mip_tensor, positional_encoding], dim=1
+        )  # [B, 4 * cg0 + cg1 + 1 + 4 * F, H, W]
 
-        assert d_theta.shape == [y0.shape[0], 5 * self.grid_channels + 1 + 4 * self.num_frequencies, crop_dim, crop_dim]
+        assert d_theta.shape == [
+            batch_size,
+            5 * self.grid_channels + 1 + 4 * self.num_frequencies,
+            crop_dim,
+            crop_dim,
+        ]
 
         d = self.texture_synthesizer(d_theta)
         return d
@@ -360,8 +390,8 @@ def train_network(image: torch.Tensor):
                 (batch_size, channels, max_crop_dim, max_crop_dim)
             )
         for batch_index in range(batch_size):
-            start_u = random.randint(0, width - crop_dim + 1)
-            start_v = random.randint(0, height - crop_dim + 1)
+            start_u = torch.randint(0, width - crop_dim + 1)
+            start_v = torch.randint(0, height - crop_dim + 1)
             batch_tensor[batch_index].copy_(
                 image[:, start_v : start_v + crop_dim, start_u : start_u + crop_dim]
             )
@@ -399,52 +429,28 @@ def train_network(image: torch.Tensor):
 
 
 def main():
-    crop_dim = 256
-    stride = 2
+    parser = argparse.ArgumentParser(
+        description="Implementation of Neural Graphics Texture Compression Supporting Random Access"
+    )
+    parser.add_argument("filename", help="The name of the file to compress")
 
-    grid = torch.rand([1, 3, 32, 32])
-    grid_w, grid_h = grid.shape[3], grid.shape[2]
+    args = parser.parse_args()
 
-    x = torch.arange(crop_dim)
-    y = torch.arange(crop_dim)
+    if not os.path.isfile(args.filename):
+        print(f"Error: {args.filename} is not a valid file")
+        sys.exit()
 
-    grid_x = (x + 0.5) / crop_dim * 32 - 0.5
-    grid_y = (y + 0.5) / crop_dim * 32 - 0.5
+    filename, file_extension = os.path.splitext(args.filename)
+    tensor: torch.Tensor = None
+    if file_extension == ".exr":
+        print(f"Valid file: {args.filename}")
+        tensor = exr.ParseEXR(args.filename)
+        print(f"{tensor.shape}")
+    else:
+        print(f"${file_extension} files are currently not supported.")
+        sys.exit()
 
-    x0 = torch.floor(grid_x)
-    y0 = torch.floor(grid_y)
-
-    grid_base_x = ((x0 + 0.5) / grid_w) * 2.0 - 1.0
-    grid_base_y = ((y0 + 0.5) / grid_h) * 2.0 - 1.0
-
-    yy, xx = torch.meshgrid(grid_base_y, grid_base_x, indexing="ij")
-    base_grid = torch.stack((xx, yy), dim=-1)
-    base_grid = base_grid.unsqueeze(0).expand(grid.shape[0], -1, -1, -1)
-
-    dx = 2.0 * stride / grid_w
-    dy = 2.0 * stride / grid_h
-
-    corner00 = base_grid + torch.tensor([dx, 0.0])
-
-    print(f"{corner00[0, 0, :, :]}")
-
-    # Your primary program logic goes here
-    # print("Hello from the main function!")
-    # x = torch.tensor([[1, 2, 3], [4, 5, 6]])
-    # print(f"Tensor:\n{x}")
-
-    # TODO: get from input
-    # numChannels = 3
-    # channelsN = 192
-    # channelsM = 320
-
-    # gridNumChannels = 32
-    # bitsPerElement = 4
-
-    # Features from 4 corners in G0, linearly interpolated feature from G1, positional encoding, mip
-
-    # TODO: what is this value???
-    # linearResidualBlockNumChannels = 32
+    torch.manual_seed(1337)
 
 
 if __name__ == "__main__":
