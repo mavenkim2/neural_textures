@@ -10,7 +10,7 @@ def ParseEXR(filename) -> torch.Tensor:
         # TODO: assumes only channels are R, G, B, A.
         # TODO: if all channels are the same, collapse into one
         for channel in file.channels:
-            if tensor == None:
+            if tensor is None:
                 tensor = torch.from_numpy(file.get(channel))
             else:
                 tensor = torch.cat(
