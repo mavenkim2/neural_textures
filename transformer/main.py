@@ -45,29 +45,29 @@ def train_network(image: torch.Tensor):
 
         utils.random_crops_into(batch_tensor, image, crop_dim)
 
-        u = torch.rand(())
+        u = torch.rand(()).item()
         mip = 0
         if u < 0.1:
-            mip = torch.randint(0, max_mip + 1, ())
+            mip = int(torch.randint(0, max_mip + 1, ()).item())
         else:
-            u = torch.rand(())
+            u = torch.rand(()).item()
             mip = math.floor(-math.log2(u) / 2)
 
         assert mip >= 0 and mip <= max_mip
 
         # See section 4 of paper
         encoded_tensor = network.global_transformation(batch_tensor)
-        assert encoded_tensor.shape == [
+        assert encoded_tensor.shape == (
             batch_size,
             network.channels_m,
-            crop_dim / 8,
-            crop_dim / 8,
-        ], f"Unexpected encoded_tensor shape: {encoded_tensor.shape}"
+            crop_dim // 8,
+            crop_dim // 8,
+        ), f"Unexpected encoded_tensor shape: {encoded_tensor.shape}"
 
         g0, g1 = network.grid_constructor_step(encoded_tensor)
 
         y0, y1, coords = network.grid_sample_step(g0, g1, crop_dim, mip)
-        output = network.texture_synthesis_step(y0, y1, crop_dim, coords, mip)
+        output = network.texture_synthesis_step(y0, y1, coords, crop_dim, mip)
 
 
 

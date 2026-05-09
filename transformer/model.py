@@ -182,7 +182,7 @@ class CompressionNetwork(nn.Module):
 
     def grid_sample_step(
         self, g0: torch.Tensor, g1: torch.Tensor, crop_dim, mip: int
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         assert g0.ndim == 4, "Sampled grid tensor should be [B, N, H, W]"
         assert g0.shape == g1.shape
 
@@ -198,13 +198,15 @@ class CompressionNetwork(nn.Module):
         grid_pixel_x = (x + 0.5) / output_w * grid_w - 0.5
         grid_pixel_y = (y + 0.5) / output_h * grid_h - 0.5
 
-        grid_pixel_floor_x = torch.floor(grid_pixel_x).long()
-        grid_pixel_floor_y = torch.floor(grid_pixel_y).long()
+        # NOTE: Wording in 4.3 is ambiguous. It suggests not snapping the top left corner 
+        # to stride, but then how are the interpolation weights calculated?
+        grid_pixel_base_x = torch.floor(grid_pixel_x / stride) * stride
+        grid_pixel_base_y = torch.floor(grid_pixel_y / stride) * stride
 
-        pixel_x0 = grid_pixel_floor_x % grid_w
-        pixel_x1 = (grid_pixel_floor_x + stride) % grid_w
-        pixel_y0 = grid_pixel_floor_y % grid_h
-        pixel_y1 = (grid_pixel_floor_y + stride) % grid_h
+        pixel_x0 = grid_pixel_base_x.long() % grid_w
+        pixel_x1 = (grid_pixel_base_x.long() + stride) % grid_w
+        pixel_y0 = grid_pixel_base_y.long() % grid_h
+        pixel_y1 = (grid_pixel_base_y.long() + stride) % grid_h
 
         y0_corner00 = g0[:, :, pixel_y0[:, None], pixel_x0[None, :]]
         y0_corner10 = g0[:, :, pixel_y0[:, None], pixel_x1[None, :]]
@@ -212,7 +214,7 @@ class CompressionNetwork(nn.Module):
         y0_corner11 = g0[:, :, pixel_y1[:, None], pixel_x1[None, :]]
 
         y0 = torch.cat((y0_corner00, y0_corner10, y0_corner01, y0_corner11), dim=1)
-        assert y0.shape[1:] == [4 * self.grid_channels, output_w, output_h]
+        assert y0.shape[1:] == (4 * self.grid_channels, output_h, output_w)
 
         # Y1: Bilerp 4 corners from g1
         y1_corner00 = g1[:, :, pixel_y0[:, None], pixel_x0[None, :]]
@@ -220,17 +222,16 @@ class CompressionNetwork(nn.Module):
         y1_corner01 = g1[:, :, pixel_y1[:, None], pixel_x0[None, :]]
         y1_corner11 = g1[:, :, pixel_y1[:, None], pixel_x1[None, :]]
 
-        # TODO: are these the right weights?
-        w1x = grid_pixel_x - grid_pixel_floor_x
-        w1y = grid_pixel_y - grid_pixel_floor_y
+        w1x = (grid_pixel_x - grid_pixel_base_x) / stride
+        w1y = (grid_pixel_y - grid_pixel_base_y) / stride
         w0x = 1.0 - w1x
         w0y = 1.0 - w1y
 
-        w1x = w1x.view(1, 1, 1, crop_dim)
-        w0x = w0x.view(1, 1, 1, crop_dim)
+        w1x = w1x.view(1, 1, 1, output_w)
+        w0x = w0x.view(1, 1, 1, output_w)
 
-        w1y = w1y.view(1, 1, crop_dim, 1)
-        w0y = w0y.view(1, 1, crop_dim, 1)
+        w1y = w1y.view(1, 1, output_h, 1)
+        w0y = w0y.view(1, 1, output_h, 1)
 
         y1 = (
             y1_corner00 * w0x * w0y
@@ -238,9 +239,11 @@ class CompressionNetwork(nn.Module):
             + y1_corner01 * w0x * w1y
             + y1_corner11 * w1x * w1y
         )
-        assert y1.shape[1:] == [self.grid_channels, output_w, output_h]
+        assert y1.shape[1:] == (self.grid_channels, output_h, output_w)
 
         # TODO: maybe arbitrary
+        grid_uv_x = (x + 0.5) / output_w
+        grid_uv_y = (y + 0.5) / output_h
         grid_uv_x = grid_uv_x * 2.0 - 1.0
         grid_uv_y = grid_uv_y * 2.0 - 1.0
 
@@ -261,6 +264,8 @@ class CompressionNetwork(nn.Module):
             crop_dim >> mip,
             crop_dim >> mip,
         )
+        assert y0.shape[1] == 4 * self.grid_channels
+        assert y1.shape[1] == self.grid_channels
         assert (
             coords.ndim == 4
             and coords.shape[0] == y0.shape[0]
@@ -270,6 +275,7 @@ class CompressionNetwork(nn.Module):
         )
 
         batch_size = y0.shape[0]
+        output_h, output_w = y0.shape[2], y0.shape[3]
         max_mip = int.bit_length(crop_dim) - 1
         pow2s = 2.0 ** torch.arange(
             self.num_frequencies, device=y0.device, dtype=y0.dtype
@@ -287,18 +293,18 @@ class CompressionNetwork(nn.Module):
             0, 3, 1, 2
         )  # [B, 4 * F, H, W]
 
-        mip_tensor = y0.new_full((batch_size, 1, crop_dim, crop_dim), mip / max_mip)
+        mip_tensor = y0.new_full((batch_size, 1, output_h, output_w), mip / max_mip)
 
         d_theta = torch.cat(
             [y0, y1, mip_tensor, positional_encoding], dim=1
         )  # [B, 4 * cg0 + cg1 + 1 + 4 * F, H, W]
 
-        assert d_theta.shape == [
+        assert d_theta.shape == (
             batch_size,
             5 * self.grid_channels + 1 + 4 * self.num_frequencies,
-            crop_dim,
-            crop_dim,
-        ]
+            output_h,
+            output_w,
+        )
 
         d = self.texture_synthesizer(d_theta)
         return d
