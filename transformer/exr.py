@@ -17,4 +17,4 @@ def ParseEXR(filename) -> torch.Tensor:
                     (tensor, torch.from_numpy(file.get(channel))), dim=-1
                 )
         assert tensor.ndim == 3
-        return tensor.permute(2, 1, 0)
+        return tensor.permute(2, 0, 1)

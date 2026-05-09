@@ -1,11 +1,13 @@
 import torch
 import exr
-import transformer.model as model
+import model
 import argparse
 import os
 import sys
 import utils
 import math
+import time
+from pathlib import Path
 
 
 # Implementation of Neural Graphics Texture Compression Supporting Random Access: https://arxiv.org/abs/2407.00021
@@ -26,13 +28,26 @@ def train_network(image: torch.Tensor):
 
     network = model.CompressionNetwork(channels).to(image.device)
     optimizer = torch.optim.Adam(network.parameters(), lr=1e-4)
+    use_amp = image.device.type == "cuda"
+    scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
 
     batch_tensor = image.new_empty(
         (batch_size, channels, stage_zero_crop_dim, stage_zero_crop_dim)
     )
 
+    start_time = time.perf_counter()
+
     for training_step in range(total_steps):
-        optimizer.zero_grad()
+        if training_step % 500 == 0:
+            with torch.no_grad(), torch.amp.autocast("cuda", enabled=use_amp):
+                preview_tensor = image.unsqueeze(0)
+                preview_output = network(preview_tensor, 0)
+            preview_output = preview_output[0].permute(1, 2, 0).detach().cpu().numpy()
+            output_path = Path(__file__).with_name(f"test{training_step}.exr")
+            exr.pyexr.write(output_path, preview_output)
+            print("outputted test")
+
+        optimizer.zero_grad(set_to_none=True)
         stage = (
             0
             if training_step < stage_zero_steps
@@ -45,9 +60,9 @@ def train_network(image: torch.Tensor):
             batch_tensor = image.new_empty(
                 (batch_size, channels, max_crop_dim, max_crop_dim)
             )
-            optimizer.param_groups[0]['lr'] = 5e-5
+            optimizer.param_groups[0]["lr"] = 5e-5
         elif training_step == stage_zero_steps + stage_one_steps:
-            optimizer.param_groups[0]['lr'] = 1e-5
+            optimizer.param_groups[0]["lr"] = 1e-5
 
         utils.random_crops_into(batch_tensor, image, crop_dim)
 
@@ -61,22 +76,42 @@ def train_network(image: torch.Tensor):
 
         assert mip >= 0 and mip <= max_mip
 
-        output = network(batch_tensor, mip)
+        with torch.amp.autocast("cuda", enabled=use_amp):
+            output = network(batch_tensor, mip)
 
-        target_tensor = batch_tensor
-        for _ in range(mip):
-            target_tensor = network.downsample(target_tensor)
+            target_tensor = batch_tensor
+            for _ in range(mip):
+                target_tensor = network.downsample(target_tensor)
 
-        assert target_tensor.shape == output.shape == (
-            batch_size,
-            channels,
-            crop_dim >> mip,
-            crop_dim >> mip,
-        )
+            assert (
+                target_tensor.shape
+                == output.shape
+                == (
+                    batch_size,
+                    channels,
+                    crop_dim >> mip,
+                    crop_dim >> mip,
+                )
+            )
 
-        loss = torch.nn.functional.mse_loss(output, target_tensor)
-        loss.backward()
-        optimizer.step()
+            loss = torch.nn.functional.mse_loss(output, target_tensor)
+
+        scaler.scale(loss).backward()
+        scaler.step(optimizer)
+        scaler.update()
+
+        if training_step % 1000 == 0:
+            t = time.perf_counter()
+            delta = t - start_time
+            start_time = t
+            print(f"Step: {training_step} Loss: {loss.item():.8f} Time: {delta:.2f}s")
+
+    with torch.no_grad(), torch.amp.autocast("cuda", enabled=use_amp):
+        output = network(image.unsqueeze(0), 0)
+    output = output[0].permute(1, 2, 0).detach().cpu().numpy()
+
+    output_path = Path(__file__).with_name("test.exr")
+    exr.pyexr.write(output_path, output)
 
 
 def main():
@@ -102,6 +137,10 @@ def main():
         sys.exit()
 
     torch.manual_seed(1337)
+    torch.backends.cudnn.benchmark = True
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    tensor = tensor.to(device=device)
+    train_network(tensor)
 
 
 if __name__ == "__main__":

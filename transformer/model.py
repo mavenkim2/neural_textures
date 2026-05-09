@@ -171,7 +171,7 @@ class CompressionNetwork(nn.Module):
         return x + (x_quantized - x).detach()
 
     def grid_constructor_step(
-        self, x: torch.Tensor, bits: 4
+        self, x: torch.Tensor, bits=4
     ) -> tuple[torch.Tensor, torch.Tensor]:
         g0 = self.linear_projection_g0(x)
         g1 = self.linear_projection_g1(x)
@@ -199,7 +199,7 @@ class CompressionNetwork(nn.Module):
         grid_pixel_x = (x + 0.5) / output_w * grid_w - 0.5
         grid_pixel_y = (y + 0.5) / output_h * grid_h - 0.5
 
-        # NOTE: Wording in 4.3 is ambiguous. It suggests not snapping the top left corner 
+        # NOTE: Wording in 4.3 is ambiguous. It suggests not snapping the top left corner
         # to stride, but then how are the interpolation weights calculated?
         grid_pixel_base_x = torch.floor(grid_pixel_x / stride) * stride
         grid_pixel_base_y = torch.floor(grid_pixel_y / stride) * stride
