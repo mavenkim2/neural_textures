@@ -153,6 +153,7 @@ class CompressionNetwork(nn.Module):
                 kernel_size=1,
             ),
         )
+        self.downsample = nn.AvgPool2d(kernel_size=2)
 
     def asymmetric_scalar_quantization(self, x, bits: 4):
         q_min = -((2**bits) - 1) / (2 ** (bits + 1))
@@ -308,3 +309,17 @@ class CompressionNetwork(nn.Module):
 
         d = self.texture_synthesizer(d_theta)
         return d
+
+    def forward(self, batch_tensor: torch.Tensor, mip) -> torch.Tensor:
+        assert batch_tensor.shape[2] == batch_tensor.shape[3]
+        crop_dim = batch_tensor.shape[2]
+        encoded = self.global_transformation(batch_tensor)
+        assert encoded.shape == (
+            batch_tensor.shape[0],
+            self.channels_m,
+            crop_dim // 8,
+            crop_dim // 8,
+        ), f"Unexpected encoded_tensor shape: {encoded.shape}"
+        g0, g1 = self.grid_constructor_step(encoded)
+        y0, y1, coords = self.grid_sample_step(g0, g1, crop_dim, mip)
+        return self.texture_synthesis_step(y0, y1, coords, crop_dim, mip)

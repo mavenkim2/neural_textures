@@ -24,12 +24,15 @@ def train_network(image: torch.Tensor):
         f"Width/height of image is less than min supported size (512): {width}, {height}"
     )
 
-    network = model.CompressionNetwork(channels)
+    network = model.CompressionNetwork(channels).to(image.device)
+    optimizer = torch.optim.Adam(network.parameters(), lr=1e-4)
+
     batch_tensor = image.new_empty(
         (batch_size, channels, stage_zero_crop_dim, stage_zero_crop_dim)
     )
 
     for training_step in range(total_steps):
+        optimizer.zero_grad()
         stage = (
             0
             if training_step < stage_zero_steps
@@ -42,6 +45,9 @@ def train_network(image: torch.Tensor):
             batch_tensor = image.new_empty(
                 (batch_size, channels, max_crop_dim, max_crop_dim)
             )
+            optimizer.param_groups[0]['lr'] = 5e-5
+        elif training_step == stage_zero_steps + stage_one_steps:
+            optimizer.param_groups[0]['lr'] = 1e-5
 
         utils.random_crops_into(batch_tensor, image, crop_dim)
 
@@ -51,25 +57,26 @@ def train_network(image: torch.Tensor):
             mip = int(torch.randint(0, max_mip + 1, ()).item())
         else:
             u = torch.rand(()).item()
-            mip = math.floor(-math.log2(u) / 2)
+            mip = min(math.floor(-math.log2(u) / 2), max_mip)
 
         assert mip >= 0 and mip <= max_mip
 
-        # See section 4 of paper
-        encoded_tensor = network.global_transformation(batch_tensor)
-        assert encoded_tensor.shape == (
+        output = network(batch_tensor, mip)
+
+        target_tensor = batch_tensor
+        for _ in range(mip):
+            target_tensor = network.downsample(target_tensor)
+
+        assert target_tensor.shape == output.shape == (
             batch_size,
-            network.channels_m,
-            crop_dim // 8,
-            crop_dim // 8,
-        ), f"Unexpected encoded_tensor shape: {encoded_tensor.shape}"
+            channels,
+            crop_dim >> mip,
+            crop_dim >> mip,
+        )
 
-        g0, g1 = network.grid_constructor_step(encoded_tensor)
-
-        y0, y1, coords = network.grid_sample_step(g0, g1, crop_dim, mip)
-        output = network.texture_synthesis_step(y0, y1, coords, crop_dim, mip)
-
-
+        loss = torch.nn.functional.mse_loss(output, target_tensor)
+        loss.backward()
+        optimizer.step()
 
 
 def main():
