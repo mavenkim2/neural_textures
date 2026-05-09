@@ -181,113 +181,48 @@ class CompressionNetwork(nn.Module):
         return g0, g1
 
     def grid_sample_step(
-        self, g0: torch.Tensor, g1: torch.Tensor, crop_dim, mip
+        self, g0: torch.Tensor, g1: torch.Tensor, crop_dim, mip: int
     ) -> tuple[torch.Tensor, torch.Tensor]:
         assert g0.ndim == 4, "Sampled grid tensor should be [B, N, H, W]"
         assert g0.shape == g1.shape
 
         grid_w, grid_h = g0.shape[3], g0.shape[2]
         stride = 2 ** (max(mip, 3) - 3)
+        output_w, output_h = crop_dim >> mip, crop_dim >> mip
 
-        x = torch.arange(crop_dim, device=g0.device, dtype=g0.dtype)
-        y = torch.arange(crop_dim, device=g0.device, dtype=g0.dtype)
+        x = torch.arange(output_w, device=g0.device, dtype=g0.dtype)
+        y = torch.arange(output_h, device=g0.device, dtype=g0.dtype)
 
         # TODO: I'm not sure if -0.5 does anything, since we're wrapping
         # Y0: Concat 4 corners from g0
-        grid_pixel_x = (x + 0.5) / crop_dim * grid_w - 0.5
-        grid_pixel_y = (y + 0.5) / crop_dim * grid_h - 0.5
+        grid_pixel_x = (x + 0.5) / output_w * grid_w - 0.5
+        grid_pixel_y = (y + 0.5) / output_h * grid_h - 0.5
 
-        grid_pixel_floor_x = torch.floor(grid_pixel_x)
-        grid_pixel_floor_y = torch.floor(grid_pixel_y)
+        grid_pixel_floor_x = torch.floor(grid_pixel_x).long()
+        grid_pixel_floor_y = torch.floor(grid_pixel_y).long()
 
-        grid_base_uv_x = ((grid_pixel_floor_x + 0.5) / grid_w) * 2.0 - 1.0
-        grid_base_uv_y = ((grid_pixel_floor_y + 0.5) / grid_h) * 2.0 - 1.0
+        pixel_x0 = grid_pixel_floor_x % grid_w
+        pixel_x1 = (grid_pixel_floor_x + stride) % grid_w
+        pixel_y0 = grid_pixel_floor_y % grid_h
+        pixel_y1 = (grid_pixel_floor_y + stride) % grid_h
 
-        yy, xx = torch.meshgrid(grid_base_uv_y, grid_base_uv_x, indexing="ij")
-        corner00 = torch.stack((xx, yy), dim=-1)
-        corner00 = corner00.unsqueeze(0).expand(g0.shape[0], -1, -1, -1)
-
-        dx = 2.0 * stride / grid_w
-        dy = 2.0 * stride / grid_h
-
-        corner10 = corner00 + g0.new_tensor([dx, 0])
-        corner01 = corner00 + g0.new_tensor([0, dy])
-        corner11 = corner00 + g0.new_tensor([dx, dy])
-
-        y0_corner00 = nn.functional.grid_sample(
-            input=g0,
-            grid=corner00,
-            mode="nearest",
-            padding_mode="reflection",
-            align_corners=False,
-        )
-
-        y0_corner10 = nn.functional.grid_sample(
-            input=g0,
-            grid=corner10,
-            mode="nearest",
-            padding_mode="reflection",
-            align_corners=False,
-        )
-
-        y0_corner01 = nn.functional.grid_sample(
-            input=g0,
-            grid=corner01,
-            mode="nearest",
-            padding_mode="reflection",
-            align_corners=False,
-        )
-
-        y0_corner11 = nn.functional.grid_sample(
-            input=g0,
-            grid=corner11,
-            mode="nearest",
-            padding_mode="reflection",
-            align_corners=False,
-        )
+        y0_corner00 = g0[:, :, pixel_y0[:, None], pixel_x0[None, :]]
+        y0_corner10 = g0[:, :, pixel_y0[:, None], pixel_x1[None, :]]
+        y0_corner01 = g0[:, :, pixel_y1[:, None], pixel_x0[None, :]]
+        y0_corner11 = g0[:, :, pixel_y1[:, None], pixel_x1[None, :]]
 
         y0 = torch.cat((y0_corner00, y0_corner10, y0_corner01, y0_corner11), dim=1)
-        assert y0.shape[1:] == [4 * self.grid_channels, crop_dim, crop_dim]
+        assert y0.shape[1:] == [4 * self.grid_channels, output_w, output_h]
 
         # Y1: Bilerp 4 corners from g1
-        y1_corner00 = nn.functional.grid_sample(
-            input=g1,
-            grid=corner00,
-            mode="nearest",
-            padding_mode="reflection",
-            align_corners=False,
-        )
-
-        y1_corner10 = nn.functional.grid_sample(
-            input=g1,
-            grid=corner10,
-            mode="nearest",
-            padding_mode="reflection",
-            align_corners=False,
-        )
-
-        y1_corner01 = nn.functional.grid_sample(
-            input=g1,
-            grid=corner01,
-            mode="nearest",
-            padding_mode="reflection",
-            align_corners=False,
-        )
-
-        y1_corner11 = nn.functional.grid_sample(
-            input=g1,
-            grid=corner11,
-            mode="nearest",
-            padding_mode="reflection",
-            align_corners=False,
-        )
-
-        grid_uv_x = (x + 0.5) / crop_dim
-        grid_uv_y = (y + 0.5) / crop_dim
+        y1_corner00 = g1[:, :, pixel_y0[:, None], pixel_x0[None, :]]
+        y1_corner10 = g1[:, :, pixel_y0[:, None], pixel_x1[None, :]]
+        y1_corner01 = g1[:, :, pixel_y1[:, None], pixel_x0[None, :]]
+        y1_corner11 = g1[:, :, pixel_y1[:, None], pixel_x1[None, :]]
 
         # TODO: are these the right weights?
-        w1x = grid_uv_x - grid_pixel_floor_x
-        w1y = grid_uv_y - grid_pixel_floor_y
+        w1x = grid_pixel_x - grid_pixel_floor_x
+        w1y = grid_pixel_y - grid_pixel_floor_y
         w0x = 1.0 - w1x
         w0y = 1.0 - w1y
 
@@ -303,9 +238,17 @@ class CompressionNetwork(nn.Module):
             + y1_corner01 * w0x * w1y
             + y1_corner11 * w1x * w1y
         )
-        assert y1.shape[1:] == [self.grid_channels, crop_dim, crop_dim]
+        assert y1.shape[1:] == [self.grid_channels, output_w, output_h]
 
-        return y0, y1
+        # TODO: maybe arbitrary
+        grid_uv_x = grid_uv_x * 2.0 - 1.0
+        grid_uv_y = grid_uv_y * 2.0 - 1.0
+
+        uv_yy, uv_xx = torch.meshgrid(grid_uv_y, grid_uv_x, indexing="ij")
+        coords = torch.stack((uv_xx, uv_yy), dim=-1)
+        coords = coords.unsqueeze(0).expand(g0.shape[0], -1, -1, -1)
+
+        return y0, y1, coords
 
     def texture_synthesis_step(
         self, y0: torch.Tensor, y1: torch.Tensor, coords, crop_dim, mip
@@ -314,10 +257,18 @@ class CompressionNetwork(nn.Module):
         # y1: [B, cg1, H, W]
         # coords: [B, H, W, 2]
 
-        assert y0.shape[0] == y1.shape[1] and y0.shape[2:] == y1.shape[2:] == (
-            crop_dim,
-            crop_dim,
+        assert y0.shape[0] == y1.shape[0] and y0.shape[2:] == y1.shape[2:] == (
+            crop_dim >> mip,
+            crop_dim >> mip,
         )
+        assert (
+            coords.ndim == 4
+            and coords.shape[0] == y0.shape[0]
+            and coords.shape[1] == crop_dim >> mip
+            and coords.shape[2] == crop_dim >> mip
+            and coords.shape[3] == 2
+        )
+
         batch_size = y0.shape[0]
         max_mip = int.bit_length(crop_dim) - 1
         pow2s = 2.0 ** torch.arange(

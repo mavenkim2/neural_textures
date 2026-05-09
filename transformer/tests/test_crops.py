@@ -51,3 +51,21 @@ def test_global_transformation(batch_tensor):
     ), f"Unexpected encoded_tensor shape: {encoded_tensor.shape}"
     assert torch.all(encoded_tensor >= -0.5)
     assert torch.all(encoded_tensor <= 0.5)
+
+
+@pytest.mark.parametrize("batch_tensor", ["out.exr"], indirect=True)
+def test_grid_constructor(batch_tensor):
+    batch_size, channels, crop_dim, _ = batch_tensor.shape
+    bits = 4
+    network = model.CompressionNetwork(channels)
+
+    encoded_tensor = network.global_transformation(batch_tensor)
+    g0, g1 = network.grid_constructor_step(encoded_tensor, bits)
+
+    qMin = -((2**bits) - 1) / (2 ** (bits + 1))
+    qMax = 0.5
+
+    assert torch.all(g0 >= qMin)
+    assert torch.all(g0 <= qMax)
+    assert torch.all(g1 >= qMin)
+    assert torch.all(g1 <= qMax)

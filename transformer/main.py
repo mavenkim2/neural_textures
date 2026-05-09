@@ -5,6 +5,7 @@ import argparse
 import os
 import sys
 import utils
+import math
 
 
 # Implementation of Neural Graphics Texture Compression Supporting Random Access: https://arxiv.org/abs/2407.00021
@@ -35,6 +36,7 @@ def train_network(image: torch.Tensor):
             else (1 if training_step < stage_zero_steps + stage_one_steps else 2)
         )
         crop_dim = 256 if stage == 0 else 512
+        max_mip = int.bit_length(crop_dim) - 1
 
         if training_step == stage_zero_steps:
             batch_tensor = image.new_empty(
@@ -42,6 +44,16 @@ def train_network(image: torch.Tensor):
             )
 
         utils.random_crops_into(batch_tensor, image, crop_dim)
+
+        u = torch.rand(())
+        mip = 0
+        if u < 0.1:
+            mip = torch.randint(0, max_mip + 1, ())
+        else:
+            u = torch.rand(())
+            mip = math.floor(-math.log2(u) / 2)
+
+        assert mip >= 0 and mip <= max_mip
 
         # See section 4 of paper
         encoded_tensor = network.global_transformation(batch_tensor)
@@ -54,23 +66,10 @@ def train_network(image: torch.Tensor):
 
         g0, g1 = network.grid_constructor_step(encoded_tensor)
 
-        u = torch.linspace(
-            start=-1.0, end=1.0, steps=crop_dim, device=image.device, dtype=image.dtype
-        )
-        v = torch.linspace(
-            start=-1.0, end=1.0, steps=crop_dim, device=image.device, dtype=image.dtype
-        )
+        y0, y1, coords = network.grid_sample_step(g0, g1, crop_dim, mip)
+        output = network.texture_synthesis_step(y0, y1, crop_dim, coords, mip)
 
-        vv, uu = torch.meshgrid(v, u, indexing="ij")
-        grid_indices = torch.stack((uu, vv), dim=-1)  # (H, W, 2)
-        assert grid_indices.shape == [crop_dim, crop_dim, 2]
-        # TODO: same values for every item in batch??
-        grid_indices = grid_indices.unsqueeze(0).expand(batch_size, -1, -1, -1)
 
-        # assert y0.shape == [batch_size, 4 * network.grid_channels, crop_dim * crop_dim], "Wrong Y0 shape"
-        # y0 = y0.view(batch_size, 4 * network.grid_channels, crop_dim, crop_dim)
-
-        # Texture synthesis (4.4)
 
 
 def main():
