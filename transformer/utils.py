@@ -20,3 +20,18 @@ def random_crops_into(output: torch.tensor, input: torch.tensor, crop_dim: int):
         output[batch_index].copy_(
             input[:, start_v : start_v + crop_dim, start_u : start_u + crop_dim]
         )
+
+def srgb_to_linear(x):
+    return torch.where(
+        x <= 0.04045,
+        x / 12.92,
+        ((x + 0.055) / 1.055) ** 2.4,
+    )
+
+def linear_to_srgb(x):
+    x = x.clamp(0, 1)
+    return torch.where(
+        x <= 0.0031308,
+        x * 12.92,
+        1.055 * (x ** (1 / 2.4)) - 0.055,
+    )

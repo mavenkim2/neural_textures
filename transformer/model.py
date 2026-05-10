@@ -170,15 +170,24 @@ class CompressionNetwork(nn.Module):
 
         return x + (x_quantized - x).detach()
 
+    def additive_uniform_noise_quantization(self, x, bits=4):
+        half_width = 1 / (2 ** (bits + 1))
+        noise = torch.empty_like(x).uniform_(-half_width, half_width)
+        return x + noise
+
     def grid_constructor_step(
-        self, x: torch.Tensor, bits=4
+        self, x: torch.Tensor, stage: int, bits=4
     ) -> tuple[torch.Tensor, torch.Tensor]:
         g0 = self.linear_projection_g0(x)
         g1 = self.linear_projection_g1(x)
         assert g0.shape[1] == self.grid_channels and g1.shape[1] == self.grid_channels
 
-        g0 = self.asymmetric_scalar_quantization(g0, bits)
-        g1 = self.asymmetric_scalar_quantization(g1, bits)
+        if stage < 2:
+            g0 = self.additive_uniform_noise_quantization(g0, bits)
+            g1 = self.additive_uniform_noise_quantization(g1, bits)
+        else:
+            g0 = self.asymmetric_scalar_quantization(g0, bits)
+            g1 = self.asymmetric_scalar_quantization(g1, bits)
         return g0, g1
 
     def grid_sample_step(
@@ -201,14 +210,18 @@ class CompressionNetwork(nn.Module):
 
         # NOTE: Wording in 4.3 is ambiguous. It suggests not snapping the top left corner
         # to stride, but then how are the interpolation weights calculated?
-        grid_pixel_base_x = torch.floor(grid_pixel_x / stride) * stride
-        grid_pixel_base_y = torch.floor(grid_pixel_y / stride) * stride
+        #grid_pixel_base_x = torch.floor(grid_pixel_x / stride) * stride
+        #grid_pixel_base_y = torch.floor(grid_pixel_y / stride) * stride
+        grid_pixel_base_x = torch.floor(grid_pixel_x)
+        grid_pixel_base_y = torch.floor(grid_pixel_y)
 
         pixel_x0 = grid_pixel_base_x.long() % grid_w
         pixel_x1 = (grid_pixel_base_x.long() + stride) % grid_w
         pixel_y0 = grid_pixel_base_y.long() % grid_h
         pixel_y1 = (grid_pixel_base_y.long() + stride) % grid_h
 
+        # NOTE: pixel_x0 and pixel_y0 have dims [1, W] and [H, 1]. These broadcast to [H, W] (copying rows/columns)
+        # Each pair from these 2D arrays then indexes the grids.
         y0_corner00 = g0[:, :, pixel_y0[:, None], pixel_x0[None, :]]
         y0_corner10 = g0[:, :, pixel_y0[:, None], pixel_x1[None, :]]
         y0_corner01 = g0[:, :, pixel_y1[:, None], pixel_x0[None, :]]
@@ -223,8 +236,10 @@ class CompressionNetwork(nn.Module):
         y1_corner01 = g1[:, :, pixel_y1[:, None], pixel_x0[None, :]]
         y1_corner11 = g1[:, :, pixel_y1[:, None], pixel_x1[None, :]]
 
-        w1x = (grid_pixel_x - grid_pixel_base_x) / stride
-        w1y = (grid_pixel_y - grid_pixel_base_y) / stride
+        #w1x = (grid_pixel_x - grid_pixel_base_x) / stride
+        #w1y = (grid_pixel_y - grid_pixel_base_y) / stride
+        w1x = (grid_pixel_x - grid_pixel_base_x)
+        w1y = (grid_pixel_y - grid_pixel_base_y)
         w0x = 1.0 - w1x
         w0y = 1.0 - w1y
 
@@ -310,7 +325,7 @@ class CompressionNetwork(nn.Module):
         d = self.texture_synthesizer(d_theta)
         return d
 
-    def forward(self, batch_tensor: torch.Tensor, mip) -> torch.Tensor:
+    def forward(self, batch_tensor: torch.Tensor, mip, stage: int) -> torch.Tensor:
         assert batch_tensor.shape[2] == batch_tensor.shape[3]
         crop_dim = batch_tensor.shape[2]
         encoded = self.global_transformation(batch_tensor)
@@ -320,6 +335,6 @@ class CompressionNetwork(nn.Module):
             crop_dim // 8,
             crop_dim // 8,
         ), f"Unexpected encoded_tensor shape: {encoded.shape}"
-        g0, g1 = self.grid_constructor_step(encoded)
+        g0, g1 = self.grid_constructor_step(encoded, stage)
         y0, y1, coords = self.grid_sample_step(g0, g1, crop_dim, mip)
         return self.texture_synthesis_step(y0, y1, coords, crop_dim, mip)

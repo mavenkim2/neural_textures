@@ -8,6 +8,8 @@ import utils
 import math
 import time
 from pathlib import Path
+from PIL import Image
+from torchvision import transforms
 
 
 # Implementation of Neural Graphics Texture Compression Supporting Random Access: https://arxiv.org/abs/2407.00021
@@ -36,16 +38,32 @@ def train_network(image: torch.Tensor):
     )
 
     start_time = time.perf_counter()
+    eval_max_mip = int.bit_length(max_crop_dim) - 1
 
     for training_step in range(total_steps):
-        if training_step % 500 == 0:
+        if training_step % 1000 == 0:
             with torch.no_grad(), torch.amp.autocast("cuda", enabled=use_amp):
                 preview_tensor = image.unsqueeze(0)
-                preview_output = network(preview_tensor, 0)
+                preview_output = network(preview_tensor, 0, 2)
+                target_mip = preview_tensor
+                total_sse = image.new_zeros(())
+                total_count = 0
+                for eval_mip in range(eval_max_mip + 1):
+                    mip_output = preview_output if eval_mip == 0 else network(preview_tensor, eval_mip, 0)
+                    diff = (mip_output - target_mip).float()
+                    total_sse = total_sse + torch.sum(diff * diff)
+                    total_count += target_mip.numel()
+                    if eval_mip < eval_max_mip:
+                        target_mip = network.downsample(target_mip)
+                total_mip_loss = total_sse / total_count
+                psnr = -10.0 * torch.log10(total_mip_loss)
             preview_output = preview_output[0].permute(1, 2, 0).detach().cpu().numpy()
             output_path = Path(__file__).with_name(f"test{training_step}.exr")
             exr.pyexr.write(output_path, preview_output)
-            print("outputted test")
+            print(
+                f"Total mip loss: {total_mip_loss.item():.8f} "
+                f"PSNR: {psnr.item():.2f} dB"
+            )
 
         optimizer.zero_grad(set_to_none=True)
         stage = (
@@ -77,7 +95,7 @@ def train_network(image: torch.Tensor):
         assert mip >= 0 and mip <= max_mip
 
         with torch.amp.autocast("cuda", enabled=use_amp):
-            output = network(batch_tensor, mip)
+            output = network(batch_tensor, mip, stage)
 
             target_tensor = batch_tensor
             for _ in range(mip):
@@ -104,10 +122,10 @@ def train_network(image: torch.Tensor):
             t = time.perf_counter()
             delta = t - start_time
             start_time = t
-            print(f"Step: {training_step} Loss: {loss.item():.8f} Time: {delta:.2f}s")
+            print(f"Step: {training_step} Time: {delta:.2f}s")
 
     with torch.no_grad(), torch.amp.autocast("cuda", enabled=use_amp):
-        output = network(image.unsqueeze(0), 0)
+        output = network(image.unsqueeze(0), 0, 2)
     output = output[0].permute(1, 2, 0).detach().cpu().numpy()
 
     output_path = Path(__file__).with_name("test.exr")
@@ -132,6 +150,12 @@ def main():
         print(f"Valid file: {args.filename}")
         tensor = exr.ParseEXR(args.filename)
         print(f"{tensor.shape}")
+    elif file_extension == ".jpg":
+        img = Image.open(args.filename).convert("RGB")
+        tensor = transforms.ToTensor()(img)
+        print(f"{tensor[:, 0, 0]}")
+        #output_path = Path(__file__).with_name("test2.exr")
+        #exr.pyexr.write(output_path, tensor.permute(1, 2, 0).numpy())
     else:
         print(f"${file_extension} files are currently not supported.")
         sys.exit()
