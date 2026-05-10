@@ -82,7 +82,7 @@ class CompressionNetwork(nn.Module):
         channels_n=192,
         channels_m=320,
         grid_channels=32,
-        num_frequencies=6,
+        num_frequencies=3,
     ):
         super().__init__()
         self.grid_channels = grid_channels
@@ -210,10 +210,10 @@ class CompressionNetwork(nn.Module):
 
         # NOTE: Wording in 4.3 is ambiguous. It suggests not snapping the top left corner
         # to stride, but then how are the interpolation weights calculated?
-        #grid_pixel_base_x = torch.floor(grid_pixel_x / stride) * stride
-        #grid_pixel_base_y = torch.floor(grid_pixel_y / stride) * stride
-        grid_pixel_base_x = torch.floor(grid_pixel_x)
-        grid_pixel_base_y = torch.floor(grid_pixel_y)
+        grid_pixel_base_x = torch.floor(grid_pixel_x / stride) * stride
+        grid_pixel_base_y = torch.floor(grid_pixel_y / stride) * stride
+        #grid_pixel_base_x = torch.floor(grid_pixel_x)
+        #grid_pixel_base_y = torch.floor(grid_pixel_y)
 
         pixel_x0 = grid_pixel_base_x.long() % grid_w
         pixel_x1 = (grid_pixel_base_x.long() + stride) % grid_w
@@ -236,10 +236,10 @@ class CompressionNetwork(nn.Module):
         y1_corner01 = g1[:, :, pixel_y1[:, None], pixel_x0[None, :]]
         y1_corner11 = g1[:, :, pixel_y1[:, None], pixel_x1[None, :]]
 
-        #w1x = (grid_pixel_x - grid_pixel_base_x) / stride
-        #w1y = (grid_pixel_y - grid_pixel_base_y) / stride
-        w1x = (grid_pixel_x - grid_pixel_base_x)
-        w1y = (grid_pixel_y - grid_pixel_base_y)
+        w1x = (grid_pixel_x - grid_pixel_base_x) / stride
+        w1y = (grid_pixel_y - grid_pixel_base_y) / stride
+        #w1x = (grid_pixel_x - grid_pixel_base_x)
+        #w1y = (grid_pixel_y - grid_pixel_base_y)
         w0x = 1.0 - w1x
         w0y = 1.0 - w1y
 
@@ -257,14 +257,13 @@ class CompressionNetwork(nn.Module):
         )
         assert y1.shape[1:] == (self.grid_channels, output_h, output_w)
 
-        # TODO: maybe arbitrary
-        grid_uv_x = (x + 0.5) / output_w
-        grid_uv_y = (y + 0.5) / output_h
-        grid_uv_x = grid_uv_x * 2.0 - 1.0
-        grid_uv_y = grid_uv_y * 2.0 - 1.0
+        pe_scale_x = 0.5 * grid_w / output_w
+        pe_scale_y = 0.5 * grid_h / output_h
+        pe_x = (x + 0.5) * pe_scale_x
+        pe_y = (y + 0.5) * pe_scale_y
 
-        uv_yy, uv_xx = torch.meshgrid(grid_uv_y, grid_uv_x, indexing="ij")
-        coords = torch.stack((uv_xx, uv_yy), dim=-1)
+        pe_yy, pe_xx = torch.meshgrid(pe_y, pe_x, indexing="ij")
+        coords = torch.stack((pe_xx, pe_yy), dim=-1)
         coords = coords.unsqueeze(0).expand(g0.shape[0], -1, -1, -1)
 
         return y0, y1, coords
@@ -293,18 +292,14 @@ class CompressionNetwork(nn.Module):
         batch_size = y0.shape[0]
         output_h, output_w = y0.shape[2], y0.shape[3]
         max_mip = int.bit_length(crop_dim) - 1
-        pow2s = 2.0 ** torch.arange(
-            self.num_frequencies, device=y0.device, dtype=y0.dtype
-        )  # [F], F=num_frequencies
+        wave_coords = coords
+        encoding_waves = []
+        for _ in range(self.num_frequencies):
+            encoding_waves.append(torch.frac(wave_coords) * 2.0 - 1.0)
+            encoding_waves.append(torch.frac(wave_coords + 0.25) * 2.0 - 1.0)
+            wave_coords = wave_coords * 2.0
 
-        vals = (
-            pow2s[:, None] * coords[..., None, :] * torch.pi
-        )  # [F, 1] * [B, H, W, 1, 2] = [B, H, W, F, 2]
-
-        positional_encoding = torch.cat(
-            (torch.sin(vals), torch.cos(vals)), dim=-1
-        )  # [B, H, W, F, 4]
-        positional_encoding = positional_encoding.flatten(-2)  # [B, H, W, 4 * F]
+        positional_encoding = torch.cat(encoding_waves, dim=-1)
         positional_encoding = positional_encoding.permute(
             0, 3, 1, 2
         )  # [B, 4 * F, H, W]

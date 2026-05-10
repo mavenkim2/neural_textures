@@ -10,6 +10,7 @@ import time
 from pathlib import Path
 from PIL import Image
 from torchvision import transforms
+import torch.profiler
 
 
 # Implementation of Neural Graphics Texture Compression Supporting Random Access: https://arxiv.org/abs/2407.00021
@@ -28,7 +29,7 @@ def train_network(image: torch.Tensor):
         f"Width/height of image is less than min supported size (512): {width}, {height}"
     )
 
-    network = model.CompressionNetwork(channels).to(image.device)
+    network = model.CompressionNetwork(channels, num_frequencies=6).to(image.device)
     optimizer = torch.optim.Adam(network.parameters(), lr=1e-4)
     use_amp = image.device.type == "cuda"
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
@@ -38,22 +39,52 @@ def train_network(image: torch.Tensor):
     )
 
     start_time = time.perf_counter()
-    eval_max_mip = int.bit_length(max_crop_dim) - 1
+    profiler_trace_dir = Path(__file__).with_name("profiler_traces")
+    profiler_trace_dir.mkdir(exist_ok=True)
+    profiler_activities = [torch.profiler.ProfilerActivity.CPU]
+    if image.device.type == "cuda":
+        profiler_activities.append(torch.profiler.ProfilerActivity.CUDA)
+    profiler = torch.profiler.profile(
+        activities=profiler_activities,
+        schedule=torch.profiler.schedule(wait=200, warmup=20, active=50, repeat=1),
+        on_trace_ready=torch.profiler.tensorboard_trace_handler(
+            str(profiler_trace_dir)
+        ),
+        record_shapes=True,
+        profile_memory=True,
+        with_stack=False,
+    )
+    profiler_enabled = False
+    if profiler_enabled:
+        profiler.start()
+        print(f"Profiler traces: {profiler_trace_dir}")
 
     for training_step in range(total_steps):
+        stage = (
+            0
+            if training_step < stage_zero_steps
+            else (1 if training_step < stage_zero_steps + stage_one_steps else 2)
+        )
+        crop_dim = 256 if stage == 0 else 512
+        max_mip = int.bit_length(crop_dim) - 1
+
         if training_step % 1000 == 0:
             with torch.no_grad(), torch.amp.autocast("cuda", enabled=use_amp):
-                preview_tensor = image.unsqueeze(0)
-                preview_output = network(preview_tensor, 0, 2)
+                preview_tensor = image[:, :crop_dim, :crop_dim].unsqueeze(0)
+                preview_output = network(preview_tensor, 0, stage)
                 target_mip = preview_tensor
                 total_sse = image.new_zeros(())
                 total_count = 0
-                for eval_mip in range(eval_max_mip + 1):
-                    mip_output = preview_output if eval_mip == 0 else network(preview_tensor, eval_mip, 0)
+                for eval_mip in range(max_mip + 1):
+                    mip_output = (
+                        preview_output
+                        if eval_mip == 0
+                        else network(preview_tensor, eval_mip, stage)
+                    )
                     diff = (mip_output - target_mip).float()
                     total_sse = total_sse + torch.sum(diff * diff)
                     total_count += target_mip.numel()
-                    if eval_mip < eval_max_mip:
+                    if eval_mip < max_mip:
                         target_mip = network.downsample(target_mip)
                 total_mip_loss = total_sse / total_count
                 psnr = -10.0 * torch.log10(total_mip_loss)
@@ -66,13 +97,6 @@ def train_network(image: torch.Tensor):
             )
 
         optimizer.zero_grad(set_to_none=True)
-        stage = (
-            0
-            if training_step < stage_zero_steps
-            else (1 if training_step < stage_zero_steps + stage_one_steps else 2)
-        )
-        crop_dim = 256 if stage == 0 else 512
-        max_mip = int.bit_length(crop_dim) - 1
 
         if training_step == stage_zero_steps:
             batch_tensor = image.new_empty(
@@ -123,6 +147,11 @@ def train_network(image: torch.Tensor):
             delta = t - start_time
             start_time = t
             print(f"Step: {training_step} Time: {delta:.2f}s")
+        if profiler_enabled:
+            profiler.step()
+
+    if profiler_enabled:
+        profiler.stop()
 
     with torch.no_grad(), torch.amp.autocast("cuda", enabled=use_amp):
         output = network(image.unsqueeze(0), 0, 2)
@@ -161,7 +190,7 @@ def main():
         sys.exit()
 
     torch.manual_seed(1337)
-    torch.backends.cudnn.benchmark = True
+    torch.backends.cudnn.benchmark = False
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     tensor = tensor.to(device=device)
     train_network(tensor)
