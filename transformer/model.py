@@ -200,8 +200,8 @@ class CompressionNetwork(nn.Module):
         stride = 2 ** (max(mip, 3) - 3)
         output_w, output_h = crop_dim >> mip, crop_dim >> mip
 
-        x = torch.arange(output_w, device=g0.device, dtype=g0.dtype)
-        y = torch.arange(output_h, device=g0.device, dtype=g0.dtype)
+        x = torch.arange(output_w, device=g0.device, dtype=torch.float32)
+        y = torch.arange(output_h, device=g0.device, dtype=torch.float32)
 
         # TODO: I'm not sure if -0.5 does anything, since we're wrapping
         # Y0: Concat 4 corners from g0
@@ -302,7 +302,7 @@ class CompressionNetwork(nn.Module):
         positional_encoding = torch.cat(encoding_waves, dim=-1)
         positional_encoding = positional_encoding.permute(
             0, 3, 1, 2
-        )  # [B, 4 * F, H, W]
+        ).to(y0.dtype)  # [B, 4 * F, H, W]
 
         mip_tensor = y0.new_full((batch_size, 1, output_h, output_w), mip / max_mip)
 
