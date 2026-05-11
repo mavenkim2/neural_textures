@@ -171,6 +171,16 @@ class CompressionNetwork(nn.Module):
 
         return x + (x_quantized - x).detach()
 
+    def constrain_to_quantization_range(self, x, bits=4):
+        levels = 2**bits
+        step = 1 / levels
+        q_min = -((levels - 1) / 2.0) * step
+        q_max = (levels / 2.0) * step
+
+        midpoint = 0.5 * (q_min + q_max)
+        half_width = 0.5 * (q_max - q_min)
+        return midpoint + half_width * torch.tanh(x)
+
     def additive_uniform_noise_quantization(self, x, bits=4):
         half_width = 1 / (2 ** (bits + 1))
         noise = torch.empty_like(x).uniform_(-half_width, half_width)
@@ -179,8 +189,8 @@ class CompressionNetwork(nn.Module):
     def grid_constructor_step(
         self, x: torch.Tensor, stage: int, bits=4
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        g0 = self.linear_projection_g0(x)
-        g1 = self.linear_projection_g1(x)
+        g0 = self.constrain_to_quantization_range(self.linear_projection_g0(x), bits)
+        g1 = self.constrain_to_quantization_range(self.linear_projection_g1(x), bits)
         assert g0.shape[1] == self.grid_channels and g1.shape[1] == self.grid_channels
 
         if stage < 2:
