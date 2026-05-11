@@ -20,8 +20,10 @@ def train_network(image: torch.Tensor):
     stage_zero_crop_dim = 256
     max_crop_dim = 512
     batch_size = 4
-    stage_zero_steps = 160000
-    stage_one_steps = 80000
+    #stage_zero_steps = 160000
+    #stage_one_steps = 80000
+    stage_zero_steps = 80000
+    stage_one_steps = 40000
     stage_two_steps = 20000
     total_steps = stage_zero_steps + stage_one_steps + stage_two_steps
 
