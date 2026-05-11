@@ -156,13 +156,14 @@ class CompressionNetwork(nn.Module):
         self.downsample = nn.AvgPool2d(kernel_size=2)
 
     def asymmetric_scalar_quantization(self, x, bits: 4):
-        q_min = -((2**bits) - 1) / (2 ** (bits + 1))
-        q_max = 0.5
         levels = 2**bits
-        scale = (q_max - q_min) / (levels - 1)
+        step = 1 / levels
+        q_min = -(levels // 2) + 1
+        q_max = levels // 2
 
-        x_clamped = torch.clamp(x, q_min, q_max)
-        x_quantized = torch.round((x_clamped - q_min) / scale) * scale + q_min
+        q = torch.round(x / step)
+        q = torch.clamp(q, q_min, q_max)
+        x_quantized = q * step
 
         assert x_quantized.shape == x.shape, (
             "Mismatched shapes after asymmetric quantization"
@@ -189,6 +190,26 @@ class CompressionNetwork(nn.Module):
             g0 = self.asymmetric_scalar_quantization(g0, bits)
             g1 = self.asymmetric_scalar_quantization(g1, bits)
         return g0, g1
+
+    def gather_grid_corners(
+        self, grid: torch.Tensor, corner_indices: torch.Tensor
+    ) -> torch.Tensor:
+        # grid: [B, C, grid_h, grid_w]
+        # corner_indices: [4, output_h, output_w]
+        batch_size, channels, _, _ = grid.shape
+        num_corners, output_h, output_w = corner_indices.shape
+
+        # grid_flat: [B, C, grid_h * grid_w]
+        grid_flat = grid.flatten(2)
+
+        # gather_indices: [B, C, 4 * output_h * output_w]
+        gather_indices = corner_indices.reshape(1, 1, -1).expand(
+            batch_size, channels, -1
+        )
+
+        # corners: [B, C, 4 * output_h * output_w] -> [B, C, 4, output_h, output_w]
+        corners = torch.gather(grid_flat, 2, gather_indices)
+        return corners.view(batch_size, channels, num_corners, output_h, output_w)
 
     def grid_sample_step(
         self, g0: torch.Tensor, g1: torch.Tensor, crop_dim, mip: int
@@ -220,21 +241,29 @@ class CompressionNetwork(nn.Module):
         pixel_y0 = grid_pixel_base_y.long() % grid_h
         pixel_y1 = (grid_pixel_base_y.long() + stride) % grid_h
 
-        # NOTE: pixel_x0 and pixel_y0 have dims [1, W] and [H, 1]. These broadcast to [H, W] (copying rows/columns)
-        # Each pair from these 2D arrays then indexes the grids.
-        y0_corner00 = g0[:, :, pixel_y0[:, None], pixel_x0[None, :]]
-        y0_corner10 = g0[:, :, pixel_y0[:, None], pixel_x1[None, :]]
-        y0_corner01 = g0[:, :, pixel_y1[:, None], pixel_x0[None, :]]
-        y0_corner11 = g0[:, :, pixel_y1[:, None], pixel_x1[None, :]]
+        # pixel_x*: [output_w], pixel_y*: [output_h]
+        # Each expression broadcasts to [output_h, output_w] and stores y * grid_w + x.
+        # corner_indices: [4, output_h, output_w], with order 00, 10, 01, 11.
+        corner_indices = torch.stack(
+            (
+                pixel_y0[:, None] * grid_w + pixel_x0[None, :],
+                pixel_y0[:, None] * grid_w + pixel_x1[None, :],
+                pixel_y1[:, None] * grid_w + pixel_x0[None, :],
+                pixel_y1[:, None] * grid_w + pixel_x1[None, :],
+            ),
+            dim=0,
+        )
 
-        y0 = torch.cat((y0_corner00, y0_corner10, y0_corner01, y0_corner11), dim=1)
+        # y0_corners: [B, C, 4, output_h, output_w]
+        y0_corners = self.gather_grid_corners(g0, corner_indices)
+
+        # y0: [B, 4 * C, output_h, output_w], corner-concatenated as 00, 10, 01, 11.
+        y0 = y0_corners.permute(0, 2, 1, 3, 4).flatten(1, 2)
         assert y0.shape[1:] == (4 * self.grid_channels, output_h, output_w)
 
         # Y1: Bilerp 4 corners from g1
-        y1_corner00 = g1[:, :, pixel_y0[:, None], pixel_x0[None, :]]
-        y1_corner10 = g1[:, :, pixel_y0[:, None], pixel_x1[None, :]]
-        y1_corner01 = g1[:, :, pixel_y1[:, None], pixel_x0[None, :]]
-        y1_corner11 = g1[:, :, pixel_y1[:, None], pixel_x1[None, :]]
+        # y1_corners: [B, C, 4, output_h, output_w]
+        y1_corners = self.gather_grid_corners(g1, corner_indices)
 
         w1x = (grid_pixel_x - grid_pixel_base_x) / stride
         w1y = (grid_pixel_y - grid_pixel_base_y) / stride
@@ -249,12 +278,13 @@ class CompressionNetwork(nn.Module):
         w1y = w1y.view(1, 1, output_h, 1)
         w0y = w0y.view(1, 1, output_h, 1)
 
-        y1 = (
-            y1_corner00 * w0x * w0y
-            + y1_corner10 * w1x * w0y
-            + y1_corner01 * w0x * w1y
-            + y1_corner11 * w1x * w1y
+        # corner_weights: [1, 1, 4, output_h, output_w], matching 00, 10, 01, 11.
+        corner_weights = torch.stack(
+            (w0x * w0y, w1x * w0y, w0x * w1y, w1x * w1y), dim=2
         )
+
+        # y1: [B, C, output_h, output_w]
+        y1 = (y1_corners * corner_weights).sum(dim=2)
         assert y1.shape[1:] == (self.grid_channels, output_h, output_w)
 
         pe_scale_x = 0.5 * grid_w / output_w
