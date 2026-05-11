@@ -39,6 +39,7 @@ def train_network(image: torch.Tensor):
     )
 
     start_time = time.perf_counter()
+    eval_max_mip = int.bit_length(max_crop_dim) - 1
     profiler_trace_dir = Path(__file__).with_name("profiler_traces")
     profiler_trace_dir.mkdir(exist_ok=True)
     profiler_activities = [torch.profiler.ProfilerActivity.CPU]
@@ -70,12 +71,12 @@ def train_network(image: torch.Tensor):
 
         if training_step % 1000 == 0:
             with torch.no_grad(), torch.amp.autocast("cuda", enabled=use_amp):
-                preview_tensor = image[:, :crop_dim, :crop_dim].unsqueeze(0)
+                preview_tensor = image.unsqueeze(0)
                 preview_output = network(preview_tensor, 0, stage)
                 target_mip = preview_tensor
                 total_sse = image.new_zeros(())
                 total_count = 0
-                for eval_mip in range(max_mip + 1):
+                for eval_mip in range(eval_max_mip + 1):
                     mip_output = (
                         preview_output
                         if eval_mip == 0
@@ -84,7 +85,7 @@ def train_network(image: torch.Tensor):
                     diff = (mip_output - target_mip).float()
                     total_sse = total_sse + torch.sum(diff * diff)
                     total_count += target_mip.numel()
-                    if eval_mip < max_mip:
+                    if eval_mip < eval_max_mip:
                         target_mip = network.downsample(target_mip)
                 total_mip_loss = total_sse / total_count
                 psnr = -10.0 * torch.log10(total_mip_loss)
@@ -182,7 +183,6 @@ def main():
     elif file_extension == ".jpg":
         img = Image.open(args.filename).convert("RGB")
         tensor = transforms.ToTensor()(img)
-        print(f"{tensor[:, 0, 0]}")
         #output_path = Path(__file__).with_name("test2.exr")
         #exr.pyexr.write(output_path, tensor.permute(1, 2, 0).numpy())
     else:
